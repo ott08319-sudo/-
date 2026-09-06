@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -14,6 +13,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 logging.basicConfig(level=logging.INFO)
 
+# ========== ПРОВЕРКА КЛЮЧЕЙ ==========
+print("🔑 ПРОВЕРКА API КЛЮЧЕЙ:")
+print(f"PIARFLOW_API_KEY: {'✅ ЕСТЬ' if os.getenv('PIARFLOW_API_KEY') else '❌ НЕТ'}")
+print(f"TRAFFY_API_KEY: {'✅ ЕСТЬ' if os.getenv('TRAFFY_API_KEY') else '❌ НЕТ'}")
+print(f"FLYER_API_KEY: {'✅ ЕСТЬ' if os.getenv('FLYER_API_KEY') else '❌ НЕТ'}")
+print(f"TGRASS_API_KEY: {'✅ ЕСТЬ' if os.getenv('TGRASS_API_KEY') else '❌ НЕТ'}")
+print(f"BOTOHUB_API_KEY: {'✅ ЕСТЬ' if os.getenv('BOTOHUB_API_KEY') else '❌ НЕТ'}")
+print(f"BOT_TOKEN: {'✅ ЕСТЬ' if os.getenv('BOT_TOKEN') else '❌ НЕТ'}")
+print("=" * 50)
+
 # ========== ПЕРЕМЕННЫЕ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -22,6 +31,7 @@ PIARFLOW_API_KEY = os.getenv("PIARFLOW_API_KEY", "")
 FLYER_API_KEY = os.getenv("FLYER_API_KEY", "")
 TGRASS_API_KEY = os.getenv("TGRASS_API_KEY", "")
 TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
+BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 
 DB_PATH = "bot.db"
 bot = Bot(token=BOT_TOKEN)
@@ -127,17 +137,16 @@ async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = 
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"Piarflow ответ: {data}")
-                    
                     if data.get("status") == "ok":
                         sponsors = data.get("sponsors", [])
                         async with aiosqlite.connect(DB_PATH) as db:
                             for s in sponsors:
                                 link = s.get("link")
-                                await db.execute(
-                                    "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (user_id, "piarflow", link, link, "unsubscribed", time.time())
-                                )
+                                if link:
+                                    await db.execute(
+                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (user_id, "piarflow", link, link, "unsubscribed", time.time())
+                                    )
                             await db.commit()
                         return sponsors
     except Exception as e:
@@ -164,8 +173,6 @@ async def check_piarflow_sponsors(user_id: int, links: list):
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"Piarflow проверка: {data}")
-                    
                     if data.get("status") == "ok":
                         results = data.get("sponsors", [])
                         async with aiosqlite.connect(DB_PATH) as db:
@@ -202,21 +209,19 @@ async def get_flyer_tasks(user_id: int, language_code: str = "ru"):
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"Flyer ответ: {data}")
-                    
                     if data.get("error"):
                         return []
-                    
                     tasks = data.get("result", [])
                     async with aiosqlite.connect(DB_PATH) as db:
                         for task in tasks:
                             link = task.get("link") or task.get("url")
                             signature = task.get("signature")
                             assignment_id = str(task.get("id"))
-                            await db.execute(
-                                "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, signature, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (user_id, "flyer", assignment_id, link, signature, "unsubscribed", time.time())
-                            )
+                            if link:
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, signature, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    (user_id, "flyer", assignment_id, link, signature, "unsubscribed", time.time())
+                                )
                         await db.commit()
                     return tasks
     except Exception as e:
@@ -272,21 +277,19 @@ async def get_tgrass_offers(user_id: int, username: str, lang: str = "ru", is_pr
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"TGrass ответ: {data}")
-                    
                     if data.get("status") == "ok":
                         return []
-                    
                     if data.get("status") == "not_ok":
                         offers = data.get("offers", [])
                         async with aiosqlite.connect(DB_PATH) as db:
                             for o in offers:
                                 assignment_id = str(o.get("offer_id"))
                                 link = o.get("link")
-                                await db.execute(
-                                    "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (user_id, "tgrass", assignment_id, link, "unsubscribed", time.time())
-                                )
+                                if link:
+                                    await db.execute(
+                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (user_id, "tgrass", assignment_id, link, "unsubscribed", time.time())
+                                    )
                             await db.commit()
                         return offers
     except Exception as e:
@@ -345,8 +348,6 @@ async def get_traffy_tasks(user_id: int, limit: int = 5, first_name: str = None,
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"Traffy ответ: {data}")
-                    
                     if data.get("ok") and data.get("tasks"):
                         tasks = data.get("tasks", [])
                         async with aiosqlite.connect(DB_PATH) as db:
@@ -360,8 +361,6 @@ async def get_traffy_tasks(user_id: int, limit: int = 5, first_name: str = None,
                                     )
                             await db.commit()
                         return tasks
-                    else:
-                        return []
     except Exception as e:
         logging.error(f"Ошибка Traffy: {e}")
     
@@ -386,8 +385,6 @@ async def check_traffy_tasks(user_id: int, assignment_ids: list):
             async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logging.info(f"Traffy проверка: {data}")
-                    
                     if data.get("ok"):
                         results = data.get("results", [])
                         async with aiosqlite.connect(DB_PATH) as db:
@@ -404,6 +401,97 @@ async def check_traffy_tasks(user_id: int, assignment_ids: list):
         logging.error(f"Ошибка Traffy check: {e}")
     
     return []
+
+# ========== BOTOHUB API ==========
+async def get_botohub_tasks(user_id: int, gender: str = None, age = None):
+    """Получает задания из Botohub"""
+    if not BOTOHUB_API_KEY:
+        logging.warning("Botohub API ключ отсутствует")
+        return []
+
+    url = "https://botohub.me/get-tasks"
+    headers = {
+        "Content-Type": "application/json",
+        "Auth": BOTOHUB_API_KEY
+    }
+    payload = {
+        "chat_id": user_id
+    }
+    if gender:
+        payload["gender"] = gender
+    if age:
+        payload["age"] = age
+    
+    try:
+        logging.info(f"Botohub запрос: {payload}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 401:
+                    logging.error("Botohub: Неверный токен")
+                    return []
+                if resp.status == 400:
+                    logging.error("Botohub: Не передан chat_id")
+                    return []
+                if resp.status == 200:
+                    data = await resp.json()
+                    logging.info(f"Botohub ответ: {data}")
+                    
+                    # Если skip=true или completed=true — заданий нет
+                    if data.get("skip") or data.get("completed"):
+                        return []
+                    
+                    tasks = data.get("tasks", [])
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        for link in tasks:
+                            if link:
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                    (user_id, "botohub", link, link, "unsubscribed", time.time())
+                                )
+                        await db.commit()
+                    return tasks
+    except Exception as e:
+        logging.error(f"Ошибка Botohub: {e}")
+    
+    return []
+
+async def check_botohub_tasks(user_id: int):
+    """Проверяет задания Botohub через повторный запрос"""
+    if not BOTOHUB_API_KEY:
+        return False
+
+    url = "https://botohub.me/get-tasks"
+    headers = {
+        "Content-Type": "application/json",
+        "Auth": BOTOHUB_API_KEY
+    }
+    payload = {
+        "chat_id": user_id
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logging.info(f"Botohub проверка: {data}")
+                    
+                    # Если completed=true — всё выполнено
+                    if data.get("completed"):
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'",
+                                (user_id,)
+                            )
+                            await db.commit()
+                        return True
+                    
+                    # Если есть задачи — не всё выполнено
+                    return False
+    except Exception as e:
+        logging.error(f"Ошибка Botohub check: {e}")
+    
+    return False
 
 # ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
@@ -427,17 +515,29 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
                     if expires_at > time.time():
                         return json.loads(payload)
     
+    logging.info(f"Запрос спонсоров для {user_id}")
+    
+    # Piarflow
     piarflow_sponsors = await get_piarflow_sponsors(user_id, user_id, max_sponsors=5)
     all_sponsors.extend(piarflow_sponsors)
     
+    # Flyer
     flyer_tasks = await get_flyer_tasks(user_id, lang)
     all_sponsors.extend(flyer_tasks)
     
+    # TGrass
     tgrass_offers = await get_tgrass_offers(user_id, username, lang, is_premium)
     all_sponsors.extend(tgrass_offers)
     
+    # Traffy
     traffy_tasks = await get_traffy_tasks(user_id, limit=5, first_name=first_name, username=username, language_code=lang)
     all_sponsors.extend(traffy_tasks)
+    
+    # Botohub
+    botohub_tasks = await get_botohub_tasks(user_id)
+    all_sponsors.extend(botohub_tasks)
+    
+    logging.info(f"Всего спонсоров: {len(all_sponsors)}")
     
     if all_sponsors:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -502,6 +602,18 @@ async def check_all_subscriptions(user_id: int):
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
                         "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'",
+                        (user_id,)
+                    )
+                    await db.commit()
+            else:
+                all_done = False
+        
+        elif service == "botohub":
+            done = await check_botohub_tasks(user_id)
+            if done:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'",
                         (user_id,)
                     )
                     await db.commit()
