@@ -17,6 +17,7 @@ from aiogram.fsm.context import FSMContext
 
 logging.basicConfig(level=logging.INFO)
 
+# ========== ПЕРЕМЕННЫЕ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
@@ -27,6 +28,8 @@ TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
 BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 
 DB_PATH = "bot.db"
+MAX_SPONSORS = 20  # ← БЕЗЛИМИТ (можно менять)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -50,6 +53,7 @@ async def init_db():
         )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS sponsor_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             service TEXT,
             assignment_id TEXT,
@@ -57,7 +61,7 @@ async def init_db():
             status TEXT DEFAULT 'unsubscribed',
             signature TEXT,
             created_at REAL,
-            PRIMARY KEY (user_id, service, assignment_id)
+            UNIQUE(user_id, service, assignment_id)
         )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS sponsor_cache (
@@ -73,6 +77,13 @@ async def init_db():
             link TEXT,
             status TEXT,
             created_at REAL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS sponsor_status (
+            user_id INTEGER PRIMARY KEY,
+            status TEXT,
+            reason TEXT,
+            updated_at REAL
         )""")
         await db.commit()
 
@@ -121,8 +132,16 @@ async def log_sponsor(user_id: int, service: str, link: str, status: str):
         )
         await db.commit()
 
-# ========== API СПОНСОРОВ ==========
-async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = 5):
+async def log_sponsor_status(user_id: int, status: str, reason: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO sponsor_status (user_id, status, reason, updated_at) VALUES (?, ?, ?, ?)",
+            (user_id, status, reason, time.time())
+        )
+        await db.commit()
+
+# ========== API СПОНСОРОВ (С ЛИМИТОМ 20) ==========
+async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = MAX_SPONSORS):
     if not PIARFLOW_API_KEY:
         return []
     url = "https://piarflow.com/v1/sponsors"
@@ -160,7 +179,7 @@ async def get_flyer_tasks(user_id: int, language_code: str = "ru"):
     if not FLYER_API_KEY:
         return []
     url = "https://api.flyerhubs.com/v1/tasks"
-    payload = {"key": FLYER_API_KEY, "user_id": user_id, "language_code": language_code, "limit": 10}
+    payload = {"key": FLYER_API_KEY, "user_id": user_id, "language_code": language_code, "limit": MAX_SPONSORS}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10) as resp:
@@ -221,7 +240,7 @@ async def check_tgrass_subscription(user_id: int):
         logging.error(f"TGrass check error: {e}")
     return False
 
-async def get_traffy_tasks(user_id: int, limit: int = 5, first_name: str = None, username: str = None, language_code: str = "ru"):
+async def get_traffy_tasks(user_id: int, limit: int = MAX_SPONSORS, first_name: str = None, username: str = None, language_code: str = "ru"):
     if not TRAFFY_API_KEY:
         return []
     url = "https://traffy.ai/publisher/tasks"
@@ -312,32 +331,62 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     
     logging.info(f"Запрос спонсоров для {user_id}")
     
-    piarflow = await get_piarflow_sponsors(user_id, user_id, 5)
+    # Piarflow
+    piarflow = await get_piarflow_sponsors(user_id, user_id, MAX_SPONSORS)
     for s in piarflow:
         await log_sponsor(user_id, "piarflow", s.get("link"), "выдан")
+        await db_execute(
+            "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, "piarflow", s.get("link"), s.get("link"), "unsubscribed", time.time())
+        )
     all_sponsors.extend(piarflow)
     
+    # Flyer
     flyer = await get_flyer_tasks(user_id, lang)
     for s in flyer:
         await log_sponsor(user_id, "flyer", s.get("link"), "выдан")
+        await db_execute(
+            "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, signature, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, "flyer", str(s.get("id")), s.get("link"), s.get("signature"), "unsubscribed", time.time())
+        )
     all_sponsors.extend(flyer)
     
+    # TGrass
     tgrass = await get_tgrass_offers(user_id, username, lang, is_premium)
     for s in tgrass:
         await log_sponsor(user_id, "tgrass", s.get("link"), "выдан")
+        await db_execute(
+            "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, "tgrass", str(s.get("offer_id")), s.get("link"), "unsubscribed", time.time())
+        )
     all_sponsors.extend(tgrass)
     
-    traffy = await get_traffy_tasks(user_id, 5, first_name, username, lang)
+    # Traffy
+    traffy = await get_traffy_tasks(user_id, MAX_SPONSORS, first_name, username, lang)
     for s in traffy:
         await log_sponsor(user_id, "traffy", s.get("target_link"), "выдан")
+        await db_execute(
+            "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, "traffy", s.get("assignment_id"), s.get("target_link"), "unsubscribed", time.time())
+        )
     all_sponsors.extend(traffy)
     
+    # Botohub
     botohub = await get_botohub_tasks(user_id)
     for s in botohub:
         await log_sponsor(user_id, "botohub", s, "выдан")
+        await db_execute(
+            "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, "botohub", s, s, "unsubscribed", time.time())
+        )
     all_sponsors.extend(botohub)
     
     logging.info(f"Всего спонсоров: {len(all_sponsors)}")
+    
+    if not all_sponsors:
+        await log_sponsor_status(user_id, "not_issued", "Нет активных заданий")
+    else:
+        await log_sponsor_status(user_id, "issued", f"Выдано {len(all_sponsors)} спонсоров")
     
     if all_sponsors:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -347,12 +396,18 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     
     return all_sponsors
 
+async def db_execute(query, params):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(query, params)
+        await db.commit()
+
 async def check_all_subscriptions(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT service, assignment_id, link, signature FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
             tasks = await c.fetchall()
     
     if not tasks:
+        await log_sponsor_status(user_id, "subscribed", "Все задания выполнены")
         return True
     
     all_done = True
@@ -404,6 +459,11 @@ async def check_all_subscriptions(user_id: int):
             else:
                 all_done = False
     
+    if not all_done:
+        await log_sponsor_status(user_id, "not_subscribed", "Пользователь не подписался на все каналы")
+    else:
+        await log_sponsor_status(user_id, "subscribed", "Все задания выполнены")
+    
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
             count = await c.fetchone()
@@ -429,7 +489,7 @@ def main_menu():
 
 def sponsors_keyboard(sponsors):
     builder = InlineKeyboardBuilder()
-    for idx, sp in enumerate(sponsors[:5], 1):
+    for idx, sp in enumerate(sponsors[:MAX_SPONSORS], 1):
         link = sp.get("link") or sp.get("target_link")
         if link:
             builder.row(types.InlineKeyboardButton(text=f"📢 Задание #{idx}", url=link))
@@ -524,49 +584,86 @@ async def top_users(message: types.Message):
         text += f"{medal} {username or f'ID{user_id}'} — {balance:.1f} ⭐\n"
     await message.answer(text, parse_mode="Markdown")
 
+# ========== КАЗИНО ==========
 @dp.message(F.text == "🎲 Казино (кубик)")
 async def casino_start(message: types.Message, state: FSMContext):
-    await state.set_state(CasinoState.waiting_for_bet)
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        types.InlineKeyboardButton(text="🎲 ЧЁТ", callback_data="casino_even"),
+        types.InlineKeyboardButton(text="🎲 НЕЧЁТ", callback_data="casino_odd")
+    )
     await message.answer(
-        "🎲 *Кубик Казино*\n\nВведи сумму ставки и вариант (чёт/нечет):\nПример: `10 чёт`",
+        "🎲 *Выбери вариант:*\n\nЧёт или Нечёт?",
+        reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
+
+@dp.callback_query(F.data.startswith("casino_"))
+async def casino_choice(callback: types.CallbackQuery, state: FSMContext):
+    choice = "чёт" if callback.data == "casino_even" else "нечет"
+    await state.update_data(choice=choice)
+    await state.set_state(CasinoState.waiting_for_bet)
+    
+    await callback.message.edit_text(
+        f"🎲 Ты выбрал *{choice}*\n\nТеперь введи сумму ставки (например: `10`):",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
 @dp.message(CasinoState.waiting_for_bet)
 async def casino_bet(message: types.Message, state: FSMContext):
     try:
-        parts = message.text.lower().split()
-        amount = float(parts[0].replace(",", "."))
-        choice = parts[1] if len(parts) > 1 else None
-        if choice not in ["чёт", "нечет"]:
-            await message.answer("❌ Введи 'чёт' или 'нечет' после суммы. Пример: `10 чёт`")
+        amount_text = message.text.replace(",", ".").strip()
+        amount_text = ''.join(c for c in amount_text if c.isdigit() or c == '.')
+        
+        if not amount_text:
+            await message.answer("❌ Введи число! Пример: `10`")
             return
+        
+        amount = float(amount_text)
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть больше 0!")
+            return
+        
         user_id = message.from_user.id
         user = await get_user(user_id)
         if not user or user["balance"] < amount:
             await message.answer(f"❌ Недостаточно средств! Твой баланс: {user['balance']:.1f} ⭐")
             return
+        
+        data = await state.get_data()
+        choice = data.get("choice")
+        if not choice:
+            await message.answer("❌ Ошибка! Начни заново: /start")
+            await state.clear()
+            return
+        
         await update_balance(user_id, -amount)
         roll = random.randint(1, 6)
         is_even = roll % 2 == 0
         win = (choice == "чёт" and is_even) or (choice == "нечет" and not is_even)
+        
         if win:
             win_amount = amount * 1.9
             await update_balance(user_id, win_amount)
             await message.answer(
-                f"🎲 Выпало: *{roll}*\n\n✅ Ты выиграл! +{win_amount:.1f} ⭐ (x1.9)\n💰 Новый баланс: {user['balance'] + win_amount - amount:.1f} ⭐",
+                f"🎲 *Результат:* {roll}\n\n✅ Ты выиграл! +{win_amount:.1f} ⭐ (x1.9)\n💰 Новый баланс: {user['balance'] + win_amount - amount:.1f} ⭐",
                 parse_mode="Markdown"
             )
         else:
             await message.answer(
-                f"🎲 Выпало: *{roll}*\n\n❌ Ты проиграл! -{amount:.1f} ⭐\n💰 Новый баланс: {user['balance'] - amount:.1f} ⭐",
+                f"🎲 *Результат:* {roll}\n\n❌ Ты проиграл! -{amount:.1f} ⭐\n💰 Новый баланс: {user['balance'] - amount:.1f} ⭐",
                 parse_mode="Markdown"
             )
+        
         await state.clear()
+        
     except Exception as e:
-        await message.answer(f"❌ Ошибка! Пример: `10 чёт`")
+        await message.answer("❌ Ошибка! Введи число. Пример: `10`")
         logging.error(f"Casino error: {e}")
+        await state.clear()
 
+# ========== ВЫВОД ЗВЁЗД ==========
 @dp.message(F.text == "💎 Вывести звёзды")
 async def withdraw_start(message: types.Message):
     user = await get_user(message.from_user.id)
@@ -605,6 +702,7 @@ async def process_withdraw(callback: types.CallbackQuery):
         except:
             pass
 
+# ========== АДМИН-ПАНЕЛЬ ==========
 @dp.message(F.text == "👑 Админ-панель")
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
@@ -613,6 +711,7 @@ async def admin_panel(message: types.Message):
         return
     kb = InlineKeyboardBuilder()
     kb.row(types.InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
+    kb.row(types.InlineKeyboardButton(text="📋 Статус спонсоров", callback_data="admin_sponsor_status"))
     kb.row(types.InlineKeyboardButton(text="📋 Логи спонсоров", callback_data="admin_logs"))
     kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
     await message.answer("👑 *Админ-панель*", reply_markup=kb.as_markup(), parse_mode="Markdown")
@@ -631,6 +730,32 @@ async def admin_stats(callback: types.CallbackQuery):
         f"📊 *Статистика*\n\n👥 Пользователей: {total}\n💰 Всего звёзд: {total_balance:.1f}",
         parse_mode="Markdown"
     )
+
+@dp.callback_query(F.data == "admin_sponsor_status")
+async def admin_sponsor_status(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, status, reason, updated_at FROM sponsor_status ORDER BY updated_at DESC LIMIT 20"
+        ) as c:
+            rows = await c.fetchall()
+    
+    if not rows:
+        await callback.message.edit_text("📋 *Статус спонсоров:*\n\nНет данных.", parse_mode="Markdown")
+        return
+    
+    text = "📋 *Статус спонсоров (последние 20):*\n\n"
+    for user_id, status, reason, updated_at in rows:
+        date = datetime.fromtimestamp(updated_at).strftime("%d.%m %H:%M")
+        emoji = "✅" if status in ["issued", "subscribed"] else "❌"
+        text += f"{emoji} [{date}] ID {user_id} → *{status}*\n"
+        if reason:
+            text += f"   📌 {reason}\n"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_logs")
 async def admin_logs(callback: types.CallbackQuery):
