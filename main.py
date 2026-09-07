@@ -34,9 +34,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ========== FSM ==========
-class CasinoState(StatesGroup):
-    waiting_for_bet = State()
-
 class AdminState(StatesGroup):
     waiting_for_reward = State()
     waiting_for_balance = State()
@@ -552,12 +549,36 @@ async def activate_user(user_id: int):
         await db.commit()
         return True
 
+# ========== УНИВЕРСАЛЬНАЯ ПРОВЕРКА ==========
+async def check_sponsors_before_action(message: types.Message):
+    """Проверяет, активирован ли пользователь. Если нет — выдаёт спонсоров."""
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    
+    if not user:
+        await register_user(user_id, message.from_user.username or "Unknown")
+        user = await get_user(user_id)
+    
+    if user and user.get('is_activated') == 1:
+        return True
+    
+    sponsors = await get_all_sponsors(message.from_user, force_refresh=True)
+    
+    if sponsors:
+        await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
+        return False
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+        await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
+        return True
+
 # ========== МЕНЮ ==========
 def main_menu():
     builder = ReplyKeyboardBuilder()
     builder.row(types.KeyboardButton(text="⭐ Заработать звёзды"), types.KeyboardButton(text="💰 Баланс"))
     builder.row(types.KeyboardButton(text="👤 Профиль"), types.KeyboardButton(text="🎁 Ежедневный бонус"))
-    builder.row(types.KeyboardButton(text="🏆 Топ пользователей"), types.KeyboardButton(text="🎲 Казино (кубик)"))
     builder.row(types.KeyboardButton(text="💎 Вывести звёзды"), types.KeyboardButton(text="👑 Админ-панель"))
     return builder.as_markup(resize_keyboard=True)
 
@@ -583,7 +604,7 @@ async def start_cmd(message: types.Message):
     
     await register_user(user_id, username, referrer_id)
     
-    sponsors = await get_all_sponsors(message.from_user)
+    sponsors = await get_all_sponsors(message.from_user, force_refresh=True)
     
     if sponsors:
         await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
@@ -596,7 +617,6 @@ async def check_subs(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     await callback.answer("🔄 Проверяю подписки...")
     
-    # 1. Принудительно проверяем Piarflow
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT link FROM sponsor_tasks WHERE user_id = ? AND service = 'piarflow' AND status != 'subscribed'", (user_id,)) as c:
             piarflow_tasks = await c.fetchall()
@@ -606,7 +626,6 @@ async def check_subs(callback: types.CallbackQuery):
         results = await check_piarflow_sponsors(user_id, links)
         logging.info(f"Piarflow проверка: {results}")
     
-    # 2. Принудительно проверяем Flyer
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT signature FROM sponsor_tasks WHERE user_id = ? AND service = 'flyer' AND status != 'subscribed'", (user_id,)) as c:
             flyer_tasks = await c.fetchall()
@@ -620,14 +639,12 @@ async def check_subs(callback: types.CallbackQuery):
                     await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?", (user_id, signature))
                     await db.commit()
     
-    # 3. Принудительно проверяем TGrass
     tgrass_done = await check_tgrass_subscription(user_id)
     if tgrass_done:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'", (user_id,))
             await db.commit()
     
-    # 4. Принудительно проверяем Traffy
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'traffy' AND status != 'subscribed'", (user_id,)) as c:
             traffy_tasks = await c.fetchall()
@@ -636,14 +653,12 @@ async def check_subs(callback: types.CallbackQuery):
         assignment_ids = [t[0] for t in traffy_tasks]
         await check_traffy_tasks(user_id, assignment_ids)
     
-    # 5. Принудительно проверяем Botohub
     botohub_done = await check_botohub_tasks(user_id)
     if botohub_done:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'", (user_id,))
             await db.commit()
     
-    # 6. Проверяем, всё ли выполнено
     if await activate_user(user_id):
         await callback.message.delete()
         await callback.message.answer("🎉 Все задания выполнены!", reply_markup=main_menu())
@@ -652,12 +667,16 @@ async def check_subs(callback: types.CallbackQuery):
 
 @dp.message(F.text == "💰 Баланс")
 async def balance_cmd(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     user = await get_user(message.from_user.id)
     if user:
         await message.answer(f"💳 Твой баланс: {user['balance']:.1f} ⭐")
 
 @dp.message(F.text == "👤 Профиль")
 async def profile_cmd(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     user = await get_user(message.from_user.id)
     if user:
         await message.answer(
@@ -667,6 +686,8 @@ async def profile_cmd(message: types.Message):
 
 @dp.message(F.text == "⭐ Заработать звёзды")
 async def earn_stars(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     user_id = message.from_user.id
     user = await get_user(user_id)
     if not user or not user.get('is_activated'):
@@ -682,6 +703,8 @@ async def earn_stars(message: types.Message):
 
 @dp.message(F.text == "🎁 Ежедневный бонус")
 async def daily_bonus(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     user_id = message.from_user.id
     today = datetime.now().date().isoformat()
     user = await get_user(user_id)
@@ -697,93 +720,10 @@ async def daily_bonus(message: types.Message):
         await db.commit()
     await message.answer("🎁 Ты получил 0.5 ⭐! Приходи завтра снова.")
 
-@dp.message(F.text == "🏆 Топ пользователей")
-async def top_users(message: types.Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10") as c:
-            rows = await c.fetchall()
-    if not rows:
-        await message.answer("❌ Пока нет пользователей.")
-        return
-    text = "🏆 *Топ пользователей по балансу:*\n\n"
-    for idx, (user_id, username, balance) in enumerate(rows, 1):
-        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"{idx}.")
-        text += f"{medal} {username or f'ID{user_id}'} — {balance:.1f} ⭐\n"
-    await message.answer(text, parse_mode="Markdown")
-
-# ========== КАЗИНО ==========
-@dp.message(F.text == "🎲 Казино (кубик)")
-async def casino_start(message: types.Message, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        types.InlineKeyboardButton(text="🎲 ЧЁТ", callback_data="casino_even"),
-        types.InlineKeyboardButton(text="🎲 НЕЧЁТ", callback_data="casino_odd")
-    )
-    await message.answer(
-        "🎲 *Выбери вариант:*\n\nЧёт или Нечёт?",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data.startswith("casino_"))
-async def casino_choice(callback: types.CallbackQuery, state: FSMContext):
-    choice = "чёт" if callback.data == "casino_even" else "нечет"
-    await state.update_data(choice=choice)
-    await state.set_state(CasinoState.waiting_for_bet)
-    await callback.message.edit_text(
-        f"🎲 Ты выбрал *{choice}*\n\nТеперь введи сумму ставки (например: `10`):",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.message(CasinoState.waiting_for_bet)
-async def casino_bet(message: types.Message, state: FSMContext):
-    try:
-        amount_text = message.text.replace(",", ".").strip()
-        amount_text = ''.join(c for c in amount_text if c.isdigit() or c == '.')
-        if not amount_text:
-            await message.answer("❌ Введи число! Пример: `10`")
-            return
-        amount = float(amount_text)
-        if amount <= 0:
-            await message.answer("❌ Сумма должна быть больше 0!")
-            return
-        user_id = message.from_user.id
-        user = await get_user(user_id)
-        if not user or user["balance"] < amount:
-            await message.answer(f"❌ Недостаточно средств! Твой баланс: {user['balance']:.1f} ⭐")
-            return
-        data = await state.get_data()
-        choice = data.get("choice")
-        if not choice:
-            await message.answer("❌ Ошибка! Начни заново: /start")
-            await state.clear()
-            return
-        await update_balance(user_id, -amount)
-        roll = random.randint(1, 6)
-        is_even = roll % 2 == 0
-        win = (choice == "чёт" and is_even) or (choice == "нечет" and not is_even)
-        if win:
-            win_amount = amount * 1.9
-            await update_balance(user_id, win_amount)
-            await message.answer(
-                f"🎲 *Результат:* {roll}\n\n✅ Ты выиграл! +{win_amount:.1f} ⭐ (x1.9)\n💰 Новый баланс: {user['balance'] + win_amount - amount:.1f} ⭐",
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(
-                f"🎲 *Результат:* {roll}\n\n❌ Ты проиграл! -{amount:.1f} ⭐\n💰 Новый баланс: {user['balance'] - amount:.1f} ⭐",
-                parse_mode="Markdown"
-            )
-        await state.clear()
-    except Exception as e:
-        await message.answer("❌ Ошибка! Введи число. Пример: `10`")
-        logging.error(f"Casino error: {e}")
-        await state.clear()
-
-# ========== ВЫВОД ЗВЁЗД ==========
 @dp.message(F.text == "💎 Вывести звёзды")
 async def withdraw_start(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer("❌ Ты не зарегистрирован!")
@@ -826,10 +766,11 @@ async def process_withdraw(callback: types.CallbackQuery):
         except:
             pass
 
-# ========== АДМИН-ПАНЕЛЬ ==========
 @dp.message(F.text == "👑 Админ-панель")
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
+    if not await check_sponsors_before_action(message):
+        return
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ У тебя нет доступа!")
         return
@@ -980,23 +921,18 @@ async def admin_test_sponsors(callback: types.CallbackQuery):
     
     results = []
     
-    # Piarflow
     piarflow = await test_piarflow(user_id)
     results.append(f"*Piarflow:* {piarflow}")
     
-    # Traffy
     traffy = await test_traffy(user_id)
     results.append(f"*Traffy:* {traffy}")
     
-    # Flyer
     flyer = await test_flyer(user_id)
     results.append(f"*Flyer:* {flyer}")
     
-    # TGrass
     tgrass = await test_tgrass(user_id)
     results.append(f"*TGrass:* {tgrass}")
     
-    # Botohub
     botohub = await test_botohub(user_id)
     results.append(f"*Botohub:* {botohub}")
     
