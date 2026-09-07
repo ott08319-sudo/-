@@ -28,6 +28,9 @@ TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
 BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 TRAFSLY_API_KEY = os.getenv("TRAFSLY_API_KEY", "")
 
+# ===== ВСТАВЛЯЮ КЛЮЧ НАПРЯМУЮ =====
+DARKBOOST_API_KEY = "db_8cQbP6qP1-_78UP2b9feQKvfVwdW5XMrd_Ge84aCILg"
+
 DB_PATH = "bot.db"
 DEFAULT_MAX_SPONSORS = 20
 
@@ -40,6 +43,9 @@ class AdminState(StatesGroup):
     waiting_for_balance = State()
     waiting_for_user_id = State()
     waiting_for_max_sponsors = State()
+
+class WithdrawState(StatesGroup):
+    waiting_for_username = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
@@ -96,6 +102,15 @@ async def init_db():
             payload TEXT NOT NULL,
             expires_at REAL NOT NULL
         )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS withdraw_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            amount REAL,
+            status TEXT DEFAULT 'pending',
+            created_at REAL
+        )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_sponsors', '20')")
         await db.commit()
@@ -129,15 +144,34 @@ async def register_user(user_id: int, username: str, referrer_id: int = None):
             "INSERT INTO users (user_id, username, referrer_id, created_at) VALUES (?, ?, ?, ?)",
             (user_id, username, referrer_id, now)
         )
+        
         if referrer_id and referrer_id != user_id:
-            reward = await get_ref_reward()
-            await db.execute("""
-                UPDATE users 
-                SET balance = balance + ?, 
-                    total_earned = total_earned + ?, 
-                    referrals_count = referrals_count + 1 
-                WHERE user_id = ?
-            """, (reward, reward, referrer_id))
+            async with db.execute(
+                "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status = 'subscribed'",
+                (user_id,)
+            ) as c:
+                count = await c.fetchone()
+            
+            if count and count[0] >= 5:
+                reward = await get_ref_reward()
+                await db.execute("""
+                    UPDATE users 
+                    SET balance = balance + ?, 
+                        total_earned = total_earned + ?, 
+                        referrals_count = referrals_count + 1 
+                    WHERE user_id = ?
+                """, (reward, reward, referrer_id))
+                
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 *Твой реферал выполнил условия!*\n"
+                        f"Подписался на {count[0]} спонсоров → +{reward} ⭐",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+        
         await db.commit()
 
 async def update_balance(user_id: int, amount: float):
@@ -447,6 +481,104 @@ async def check_trafsly_sponsors(user_id: int, assignment_ids: list):
     
     return results
 
+# ========== DARKBOOST API ==========
+async def get_darkboost_sponsors(user_id: int, chat_id: int = None, username: str = "", first_name: str = "", last_name: str = "", language_code: str = "ru", is_premium: bool = False, max_sponsors: int = 10):
+    if not DARKBOOST_API_KEY:
+        return []
+    
+    url = "https://darkboosts.com/api/v1/sponsors"
+    headers = {
+        "Auth": DARKBOOST_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "user_id": user_id,
+        "chat_id": chat_id or user_id,
+        "username": username,
+        "first_name": first_name,
+        "last_name": last_name,
+        "language_code": language_code,
+        "is_premium": is_premium,
+        "max_sponsors": max_sponsors
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logging.info(f"DarkBoost ответ: {data}")
+                    
+                    if data.get("ok") and data.get("status") == "ok":
+                        sponsors = data.get("sponsors", [])
+                        session_id = data.get("session_id")
+                        
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            for s in sponsors:
+                                link = s.get("link")
+                                offer_id = s.get("id")
+                                if link:
+                                    await db.execute(
+                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (user_id, "darkboost", str(offer_id) if offer_id else link, link, "unsubscribed", time.time())
+                                    )
+                            if session_id:
+                                await db.execute(
+                                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                                    (f"darkboost_session_{user_id}", str(session_id))
+                                )
+                            await db.commit()
+                        return sponsors
+    except Exception as e:
+        logging.error(f"Ошибка DarkBoost: {e}")
+    return []
+
+async def check_darkboost_sponsors(user_id: int, session_id: int = None):
+    if not DARKBOOST_API_KEY:
+        return False
+    
+    if not session_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT value FROM settings WHERE key = ?", (f"darkboost_session_{user_id}",)) as c:
+                row = await c.fetchone()
+                if row:
+                    session_id = int(row[0])
+    
+    if not session_id:
+        return False
+    
+    url = "https://darkboosts.com/api/v1/check"
+    headers = {
+        "Auth": DARKBOOST_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "user_id": user_id,
+        "chat_id": user_id,
+        "session_id": session_id
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logging.info(f"DarkBoost проверка: {data}")
+                    
+                    if data.get("status") == "ok":
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'darkboost'",
+                                (user_id,)
+                            )
+                            await db.commit()
+                        return True
+                    else:
+                        return False
+    except Exception as e:
+        logging.error(f"Ошибка проверки DarkBoost: {e}")
+    return False
+
 # ========== ТЕСТЫ СПОНСОРОВ ==========
 async def test_piarflow(user_id: int):
     if not PIARFLOW_API_KEY:
@@ -508,6 +640,17 @@ async def test_trafsly(user_id: int):
         return "❌ Ключ не установлен"
     try:
         sponsors = await get_trafsly_sponsors(user_id, user_id, max_sponsors=5)
+        if sponsors:
+            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
+        return "❌ 0 спонсоров (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
+async def test_darkboost(user_id: int):
+    if not DARKBOOST_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        sponsors = await get_darkboost_sponsors(user_id, user_id, max_sponsors=5)
         if sponsors:
             return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
         return "❌ 0 спонсоров (нет заданий или ошибка)"
@@ -594,6 +737,17 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         await log_sponsor(user_id, "trafsly", s.get("link"), "выдан")
     all_sponsors.extend(trafsly)
     
+    # DarkBoost
+    darkboost = await get_darkboost_sponsors(
+        user_id, user_id, username, first_name, "", lang, is_premium, max_sponsors
+    )
+    for s in darkboost:
+        await log_sponsor(user_id, "darkboost", s.get("link"), "выдан")
+    all_sponsors.extend(darkboost)
+    
+    # Обрезаем по общему лимиту
+    all_sponsors = all_sponsors[:max_sponsors]
+    
     logging.info(f"Всего спонсоров: {len(all_sponsors)}")
     
     if not all_sponsors:
@@ -666,6 +820,25 @@ async def check_all_subscriptions(user_id: int):
                     await db.commit()
             else:
                 all_done = False
+    
+    # DarkBoost
+    darkboost_done = await check_darkboost_sponsors(user_id)
+    if darkboost_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'darkboost'",
+                (user_id,)
+            )
+            await db.commit()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND service = 'darkboost' AND status != 'subscribed'",
+                (user_id,)
+            ) as c:
+                count = await c.fetchone()
+                if count and count[0] > 0:
+                    all_done = False
     
     if not all_done:
         await log_sponsor_status(user_id, "not_subscribed", "Пользователь не подписался на все каналы")
@@ -931,6 +1104,16 @@ async def check_subs(callback: types.CallbackQuery):
                 except:
                     pass
     
+    # 7. DarkBoost
+    darkboost_done = await check_darkboost_sponsors(user_id)
+    if darkboost_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'darkboost'",
+                (user_id,)
+            )
+            await db.commit()
+    
     # ФИНАЛЬНАЯ ПРОВЕРКА
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
@@ -1036,7 +1219,7 @@ async def daily_bonus(message: types.Message):
     await message.answer("🎁 *Ты получил 0.5 ⭐!* Приходи завтра снова.", parse_mode="Markdown")
 
 @dp.message(F.text == "💎 Вывод")
-async def withdraw_start(message: types.Message):
+async def withdraw_start(message: types.Message, state: FSMContext):
     if not await check_sponsors_before_action(message):
         return
     user = await get_user(message.from_user.id)
@@ -1046,11 +1229,58 @@ async def withdraw_start(message: types.Message):
     if user["balance"] < 15:
         await message.answer(f"❌ Минимальная сумма вывода — 15 ⭐. Твой баланс: {user['balance']:.1f} ⭐")
         return
+    
+    await state.set_state(WithdrawState.waiting_for_username)
     await message.answer(
-        f"💎 *Вывод звёзд*\n\nТвой баланс: {user['balance']:.1f} ⭐\nВыбери сумму:",
-        reply_markup=withdraw_keyboard(),
+        "💎 *Вывод звёзд*\n\n"
+        "Введи свой *username* (без @), на который отправить подарок.\n"
+        "Пример: `ivan_durov`\n\n"
+        "Если не хочешь указывать — отправь `-`",
         parse_mode="Markdown"
     )
+
+@dp.message(WithdrawState.waiting_for_username)
+async def withdraw_username(message: types.Message, state: FSMContext):
+    username = message.text.strip()
+    if username == "-":
+        username = "Не указан"
+    else:
+        username = username.replace("@", "")
+    
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    amount = 15
+    
+    await update_balance(user_id, -amount)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO withdraw_requests (user_id, username, amount, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, username, amount, time.time())
+        )
+        await db.commit()
+    
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔔 *Новая заявка на вывод!*\n\n"
+                f"👤 Пользователь: ID {user_id}\n"
+                f"💰 Сумма: {amount} ⭐\n"
+                f"📌 Username: @{username}\n"
+                f"🔗 Ссылка: tg://user?id={user_id}",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+    
+    await message.answer(
+        f"✅ *Заявка на вывод {amount} ⭐ принята!*\n"
+        f"Подарок будет отправлен на @{username} в течение 24 часов.\n\n"
+        f"Если username указан неверно — свяжись с админом.",
+        parse_mode="Markdown"
+    )
+    await state.clear()
 
 @dp.callback_query(F.data.startswith("withdraw_"))
 async def process_withdraw(callback: types.CallbackQuery):
@@ -1252,6 +1482,9 @@ async def admin_test_sponsors(callback: types.CallbackQuery):
     trafsly = await test_trafsly(user_id)
     results.append(f"*Trafsly:* {trafsly}")
     
+    darkboost = await test_darkboost(user_id)
+    results.append(f"*DarkBoost:* {darkboost}")
+    
     text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
@@ -1305,6 +1538,9 @@ async def admin_test_user_process(message: types.Message, state: FSMContext):
     
     trafsly = await test_trafsly(user_id)
     results.append(f"*Trafsly:* {trafsly}")
+    
+    darkboost = await test_darkboost(user_id)
+    results.append(f"*DarkBoost:* {darkboost}")
     
     status_text = "✅ Активирован" if user.get('is_activated') == 1 else "❌ Не активирован"
     results.append(f"*Статус:* {status_text}")
