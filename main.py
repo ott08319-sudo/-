@@ -538,6 +538,7 @@ def main_menu():
         builder.row(types.KeyboardButton(text="👑 Админ-панель"))
     return builder.as_markup(resize_keyboard=True)
 
+# ========== СТАРТ ==========
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
@@ -561,8 +562,11 @@ async def start_cmd(message: types.Message):
         kb.row(types.InlineKeyboardButton(text="✅ Проверить подписки", callback_data="check_subs"))
         await message.answer("📌 Выполни задания:", reply_markup=kb.as_markup())
     else:
-        await activate_user(user_id)
-        await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
+        # ПРИНУДИТЕЛЬНАЯ АКТИВАЦИЯ (ФИКС)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+        await message.answer("🎉 Добро пожаловать! Ты активирован.", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "check_subs")
 async def check_subs(callback: types.CallbackQuery):
