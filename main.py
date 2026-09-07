@@ -27,9 +27,7 @@ TGRASS_API_KEY = os.getenv("TGRASS_API_KEY", "")
 TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
 BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 TRAFSLY_API_KEY = os.getenv("TRAFSLY_API_KEY", "")
-
-# ===== ВСТАВЛЯЮ КЛЮЧ НАПРЯМУЮ =====
-DARKBOOST_API_KEY = "db_8cQbP6qP1-_78UP2b9feQKvfVwdW5XMrd_Ge84aCILg"
+DARKBOOST_API_KEY = os.getenv("DARKBOOST_API_KEY", "")
 
 DB_PATH = "bot.db"
 DEFAULT_MAX_SPONSORS = 20
@@ -43,6 +41,7 @@ class AdminState(StatesGroup):
     waiting_for_balance = State()
     waiting_for_user_id = State()
     waiting_for_max_sponsors = State()
+    waiting_for_sponsor_reward = State()
 
 class WithdrawState(StatesGroup):
     waiting_for_username = State()
@@ -113,6 +112,7 @@ async def init_db():
         )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_sponsors', '20')")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_reward', '0.4')")
         await db.commit()
 
 async def get_user(user_id: int):
@@ -134,6 +134,12 @@ async def get_max_sponsors():
             row = await c.fetchone()
             return int(row[0]) if row else DEFAULT_MAX_SPONSORS
 
+async def get_sponsor_reward():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key='sponsor_reward'") as c:
+            row = await c.fetchone()
+            return float(row[0]) if row else 0.4
+
 async def register_user(user_id: int, username: str, referrer_id: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)) as c:
@@ -146,31 +152,27 @@ async def register_user(user_id: int, username: str, referrer_id: int = None):
         )
         
         if referrer_id and referrer_id != user_id:
+            # Считаем количество спонсоров (пока ещё не подписанных)
             async with db.execute(
                 "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status = 'subscribed'",
                 (user_id,)
             ) as c:
                 count = await c.fetchone()
+                sponsors_count = count[0] if count else 0
             
-            if count and count[0] >= 5:
-                reward = await get_ref_reward()
-                await db.execute("""
-                    UPDATE users 
-                    SET balance = balance + ?, 
-                        total_earned = total_earned + ?, 
-                        referrals_count = referrals_count + 1 
-                    WHERE user_id = ?
-                """, (reward, reward, referrer_id))
-                
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 *Твой реферал выполнил условия!*\n"
-                        f"Подписался на {count[0]} спонсоров → +{reward} ⭐",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
+            # Отправляем уведомление о новом реферале
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🔔 *НОВЫЙ РЕФЕРАЛ!*\n\n"
+                    f"🛫 Реферал: {username or 'Без юзернейма'} (@{username or 'нет'})\n"
+                    f"🗂 Ему выдано спонсоров: {sponsors_count}\n\n"
+                    f"🖥 *После подписки на спонсоров вы получите награду!*\n"
+                    f"📊 Награда зависит от количества спонсоров!",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
         
         await db.commit()
 
@@ -579,84 +581,6 @@ async def check_darkboost_sponsors(user_id: int, session_id: int = None):
         logging.error(f"Ошибка проверки DarkBoost: {e}")
     return False
 
-# ========== ТЕСТЫ СПОНСОРОВ ==========
-async def test_piarflow(user_id: int):
-    if not PIARFLOW_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        sponsors = await get_piarflow_sponsors(user_id, user_id, 5)
-        if sponsors:
-            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
-        return "❌ 0 спонсоров (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_traffy(user_id: int):
-    if not TRAFFY_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        tasks = await get_traffy_tasks(user_id, 5)
-        if tasks:
-            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t.get('target_link')}" for t in tasks[:5]])
-        return "❌ 0 заданий (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_flyer(user_id: int):
-    if not FLYER_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        tasks = await get_flyer_tasks(user_id, "ru")
-        if tasks:
-            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t.get('link')}" for t in tasks[:5]])
-        return "❌ 0 заданий (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_tgrass(user_id: int):
-    if not TGRASS_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        offers = await get_tgrass_offers(user_id, "test", "ru", False)
-        if offers:
-            return f"✅ {len(offers)} офферов:\n" + "\n".join([f"  • {o.get('link')}" for o in offers[:5]])
-        return "❌ 0 офферов (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_botohub(user_id: int):
-    if not BOTOHUB_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        tasks = await get_botohub_tasks(user_id)
-        if tasks:
-            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t}" for t in tasks[:5]])
-        return "❌ 0 заданий (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_trafsly(user_id: int):
-    if not TRAFSLY_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        sponsors = await get_trafsly_sponsors(user_id, user_id, max_sponsors=5)
-        if sponsors:
-            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
-        return "❌ 0 спонсоров (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-async def test_darkboost(user_id: int):
-    if not DARKBOOST_API_KEY:
-        return "❌ Ключ не установлен"
-    try:
-        sponsors = await get_darkboost_sponsors(user_id, user_id, max_sponsors=5)
-        if sponsors:
-            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
-        return "❌ 0 спонсоров (нет заданий или ошибка)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
 # ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
@@ -850,12 +774,88 @@ async def check_all_subscriptions(user_id: int):
             count = await c.fetchone()
             return count[0] == 0
 
-async def activate_user(user_id: int):
+async def activate_user(user_id: int, username: str = "Unknown"):
     is_all_done = await check_all_subscriptions(user_id)
     if not is_all_done:
         return False
+    
     async with aiosqlite.connect(DB_PATH) as db:
+        # Получаем referrer_id ДО активации
+        async with db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)) as c:
+            row = await c.fetchone()
+            referrer_id = row[0] if row else None
+        
+        # Активируем пользователя
         await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+        
+        if referrer_id and referrer_id != user_id:
+            # Считаем количество подписанных спонсоров
+            async with db.execute(
+                "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status = 'subscribed'",
+                (user_id,)
+            ) as c:
+                count = await c.fetchone()
+                sponsors_count = count[0] if count else 0
+            
+            # Рассчитываем награду за спонсоров
+            sponsor_reward = await get_sponsor_reward()
+            reward = sponsors_count * sponsor_reward
+            
+            if reward > 0:
+                await db.execute("""
+                    UPDATE users 
+                    SET balance = balance + ?, 
+                        total_earned = total_earned + ?, 
+                        referrals_count = referrals_count + 1 
+                    WHERE user_id = ?
+                """, (reward, reward, referrer_id))
+            
+            # ===== БОНУС ЗА КАЖДЫЕ 5 АКТИВНЫХ РЕФЕРАЛОВ =====
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = ? AND is_activated = 1",
+                (referrer_id,)
+            ) as c:
+                active_refs = (await c.fetchone())[0]
+            
+            if active_refs % 5 == 0 and active_refs > 0:
+                bonus = 15
+                await db.execute("""
+                    UPDATE users 
+                    SET balance = balance + ?, 
+                        total_earned = total_earned + ? 
+                    WHERE user_id = ?
+                """, (bonus, bonus, referrer_id))
+                
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 *БОНУС ЗА РЕФЕРАЛОВ!*\n\n"
+                        f"Ты привёл *{active_refs} активных рефералов*!\n"
+                        f"💰 Получи бонус: *+{bonus} ⭐*\n\n"
+                        f"Следующий бонус будет на *{active_refs + 5}* рефералов!",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+            
+            # Получаем новый баланс реферера (после всех начислений)
+            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (referrer_id,)) as c:
+                new_balance = (await c.fetchone())[0]
+            
+            # ===== УВЕДОМЛЕНИЕ О ПОДТВЕРЖДЕНИИ =====
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🆗 *Реферал подтвердил подписку!*\n\n"
+                    f"👤 Реферал: @{username or 'нет'}\n"
+                    f"💬 Награда: +{reward:.1f}⭐ ({sponsors_count} × {sponsor_reward})\n"
+                    f"📊 Спонсоров у реферала: {sponsors_count}\n"
+                    f"💎 *Твой баланс: {new_balance:.1f}⭐*",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.error(f"Ошибка отправки уведомления рефереру {referrer_id}: {e}")
+        
         await db.commit()
         return True
 
@@ -876,15 +876,17 @@ async def check_sponsors_before_action(message: types.Message):
     if sponsors:
         await message.answer(
             "📌 *Выполни задания для доступа к боту:*",
-            reply_markup=sponsors_keyboard(sponsors, 1),
+            reply_markup=tasks_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
         return False
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
-            await db.commit()
-        await message.answer("🎉 *Добро пожаловать!*", reply_markup=main_menu(), parse_mode="Markdown")
+        await activate_user(user_id, message.from_user.username or "Unknown")
+        await message.answer(
+            "🎉 *Добро пожаловать!*",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
         return True
 
 # ========== КЛАВИАТУРЫ ==========
@@ -901,47 +903,41 @@ def main_menu():
     builder.row(types.KeyboardButton(text="👑 Админ"))
     return builder.as_markup(resize_keyboard=True)
 
-def sponsors_keyboard(sponsors, page=1):
+def tasks_keyboard(tasks, page=1):
+    """Клавиатура с кнопками 'Я выполнил' для каждого задания"""
     builder = InlineKeyboardBuilder()
     
     per_page = 15
-    total_pages = (len(sponsors) + per_page - 1) // per_page if sponsors else 1
+    total_pages = (len(tasks) + per_page - 1) // per_page if tasks else 1
     start = (page - 1) * per_page
     end = start + per_page
-    page_sponsors = sponsors[start:end]
+    page_tasks = tasks[start:end]
     
-    row_buttons = []
-    for sp in page_sponsors:
-        if not isinstance(sp, dict):
+    for idx, task in enumerate(page_tasks, start + 1):
+        if not isinstance(task, dict):
             continue
-        link = sp.get("link") or sp.get("target_link")
+        link = task.get("link") or task.get("target_link")
+        service = task.get("service") or task.get("service_name") or "Задание"
         if link and link.startswith("http"):
-            row_buttons.append(types.InlineKeyboardButton(
-                text=f"📢 Подписаться",
-                url=link
-            ))
-    
-    for i in range(0, len(row_buttons), 2):
-        builder.row(*row_buttons[i:i+2])
+            builder.row(
+                types.InlineKeyboardButton(text=f"📢 {service[:15]}", url=link),
+                types.InlineKeyboardButton(text="✅ Я выполнил", callback_data=f"task_done_{idx}")
+            )
     
     nav_row = []
     if page > 1:
         nav_row.append(types.InlineKeyboardButton(
             text="⬅️ Назад",
-            callback_data=f"sponsors_page_{page - 1}"
+            callback_data=f"tasks_page_{page - 1}"
         ))
     if page < total_pages:
         nav_row.append(types.InlineKeyboardButton(
             text="➡️ Далее",
-            callback_data=f"sponsors_page_{page + 1}"
+            callback_data=f"tasks_page_{page + 1}"
         ))
     if nav_row:
         builder.row(*nav_row)
     
-    builder.row(types.InlineKeyboardButton(
-        text="✅ Проверить",
-        callback_data="check_subs"
-    ))
     return builder.as_markup()
 
 def admin_keyboard():
@@ -952,14 +948,10 @@ def admin_keyboard():
     )
     builder.row(
         types.InlineKeyboardButton(text="📋 Логи", callback_data="admin_logs"),
-        types.InlineKeyboardButton(text="⚙ Награда", callback_data="admin_set_reward")
+        types.InlineKeyboardButton(text="⚙ Награда за спонсора", callback_data="admin_set_sponsor_reward")
     )
     builder.row(
         types.InlineKeyboardButton(text="💰 Баланс", callback_data="admin_give_balance"),
-        types.InlineKeyboardButton(text="🧪 Тест", callback_data="admin_test_sponsors")
-    )
-    builder.row(
-        types.InlineKeyboardButton(text="🔍 Тест для юзера", callback_data="admin_test_user"),
         types.InlineKeyboardButton(text="⚙ Максимум спонсоров", callback_data="admin_set_max_sponsors")
     )
     builder.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
@@ -991,158 +983,85 @@ async def start_cmd(message: types.Message):
     
     if sponsors:
         await message.answer(
-            "📌 *Выполни задания для доступа к боту:*",
-            reply_markup=sponsors_keyboard(sponsors, 1),
+            "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
+            reply_markup=tasks_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
     else:
-        await activate_user(user_id)
+        await activate_user(user_id, username)
         await message.answer(
             "🎉 *Добро пожаловать!*",
             reply_markup=main_menu(),
             parse_mode="Markdown"
         )
 
-@dp.callback_query(F.data == "check_subs")
-async def check_subs(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("task_done_"))
+async def task_done(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    await callback.answer("🔄 Проверяю...")
+    task_index = int(callback.data.split("_")[2])
     
-    logging.info(f"Начинаю проверку для {user_id}")
-    
-    # 1. Piarflow
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT link FROM sponsor_tasks WHERE user_id = ? AND service = 'piarflow' AND status != 'subscribed'", (user_id,)) as c:
-            piarflow_tasks = await c.fetchall()
-    
-    if piarflow_tasks:
-        links = [t[0] for t in piarflow_tasks]
-        results = await check_piarflow_sponsors(user_id, links)
-        logging.info(f"Piarflow результаты: {results}")
-        
-        for r in results:
-            if r.get("status") in ["subscribed", "not_counted"]:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'piarflow' AND link = ?",
-                        (user_id, r.get("link"))
-                    )
-                    await db.commit()
-    
-    # 2. Flyer
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT signature FROM sponsor_tasks WHERE user_id = ? AND service = 'flyer' AND status != 'subscribed'", (user_id,)) as c:
-            flyer_tasks = await c.fetchall()
-    
-    for row in flyer_tasks:
-        signature = row[0]
-        if signature:
-            done = await check_flyer_task(user_id, signature)
-            if done:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?",
-                        (user_id, signature)
-                    )
-                    await db.commit()
-    
-    # 3. TGrass
-    if await check_tgrass_subscription(user_id):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'",
-                (user_id,)
-            )
-            await db.commit()
-    
-    # 4. Traffy
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'traffy' AND status != 'subscribed'", (user_id,)) as c:
-            traffy_tasks = await c.fetchall()
-    
-    if traffy_tasks:
-        assignment_ids = [t[0] for t in traffy_tasks]
-        results = await check_traffy_tasks(user_id, assignment_ids)
-        for r in results:
-            if r.get("status") == "completed":
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'traffy' AND assignment_id = ?",
-                        (user_id, r.get("assignment_id"))
-                    )
-                    await db.commit()
-    
-    # 5. Botohub
-    if await check_botohub_tasks(user_id):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'",
-                (user_id,)
-            )
-            await db.commit()
-    
-    # 6. Trafsly
+    # Получаем список текущих заданий из кэша
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT assignment_id, need_check FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
-            (user_id,)
+            "SELECT payload FROM sponsor_cache WHERE cache_key = ?",
+            (f"all_sponsors_{user_id}",)
         ) as c:
-            trafsly_tasks = await c.fetchall()
+            row = await c.fetchone()
     
-    if trafsly_tasks:
-        for assignment_id, need_check in trafsly_tasks:
-            if need_check == 0:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
-                        (user_id, assignment_id)
-                    )
-                    await db.commit()
-            else:
-                try:
-                    await check_trafsly_sponsors(user_id, [int(assignment_id)])
-                except:
-                    pass
+    if not row:
+        await callback.answer("❌ Задания устарели, обнови страницу!")
+        return
     
-    # 7. DarkBoost
-    darkboost_done = await check_darkboost_sponsors(user_id)
-    if darkboost_done:
+    sponsors = json.loads(row[0])
+    
+    # Помечаем задание как выполненное
+    if task_index <= len(sponsors):
+        task = sponsors[task_index - 1]
+        link = task.get("link") or task.get("target_link")
+        service = task.get("service") or "unknown"
+        
+        # Сохраняем в БД как выполненное
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'darkboost'",
-                (user_id,)
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND link = ? AND service = ?",
+                (user_id, link, service)
             )
             await db.commit()
-    
-    # ФИНАЛЬНАЯ ПРОВЕРКА
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
-            count = await c.fetchone()
-            all_done = count[0] == 0
-    
-    if all_done:
+        
+        # Убираем выполненное задание из списка
+        del sponsors[task_index - 1]
+        
+        # Обновляем кэш
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+            await db.execute(
+                "INSERT OR REPLACE INTO sponsor_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
+                (f"all_sponsors_{user_id}", json.dumps(sponsors), time.time() + 300)
+            )
             await db.commit()
         
-        await callback.message.delete()
-        await callback.message.answer(
-            "🎉 *Все задания выполнены! Добро пожаловать!*",
-            reply_markup=main_menu(),
-            parse_mode="Markdown"
-        )
-    else:
-        await callback.answer("❌ Выполни не все задания!", show_alert=True)
-        
-        user = types.User(id=user_id, is_bot=False, first_name="User", last_name=None, username=None, language_code="ru")
-        sponsors = await get_all_sponsors(user, force_refresh=True)
+        # Проверяем, остались ли задания
         if sponsors:
-            await callback.message.edit_reply_markup(
-                reply_markup=sponsors_keyboard(sponsors, 1)
+            await callback.message.edit_text(
+                "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
+                reply_markup=tasks_keyboard(sponsors, 1),
+                parse_mode="Markdown"
             )
+            await callback.answer("✅ Задание выполнено! Осталось ещё.")
+        else:
+            # Все задания выполнены → активируем пользователя
+            await activate_user(user_id, callback.from_user.username or "Unknown")
+            await callback.message.delete()
+            await callback.message.answer(
+                "🎉 *Все задания выполнены! Добро пожаловать!*",
+                reply_markup=main_menu(),
+                parse_mode="Markdown"
+            )
+            await callback.answer("🎉 Ты выполнил все задания!")
+    else:
+        await callback.answer("❌ Ошибка! Попробуй снова.")
 
-@dp.callback_query(F.data.startswith("sponsors_page_"))
-async def sponsors_page(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("tasks_page_"))
+async def tasks_page(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     
@@ -1154,13 +1073,13 @@ async def sponsors_page(callback: types.CallbackQuery):
             row = await c.fetchone()
     
     if not row:
-        await callback.answer("❌ Спонсоры устарели, обновите страницу!")
+        await callback.answer("❌ Задания устарели, обновите страницу!")
         return
     
     sponsors = json.loads(row[0])
     try:
         await callback.message.edit_reply_markup(
-            reply_markup=sponsors_keyboard(sponsors, page)
+            reply_markup=tasks_keyboard(sponsors, page)
         )
     except Exception as e:
         await callback.answer("❌ Ошибка при переключении страницы!")
@@ -1170,13 +1089,30 @@ async def sponsors_page(callback: types.CallbackQuery):
 async def profile_cmd(message: types.Message):
     if not await check_sponsors_before_action(message):
         return
-    user = await get_user(message.from_user.id)
+    user_id = message.from_user.id
+    user = await get_user(user_id)
     if user:
+        # Получаем количество активных рефералов (которые подтвердили подписку)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = ? AND is_activated = 1",
+                (user_id,)
+            ) as c:
+                active_refs = (await c.fetchone())[0]
+            
+            # Всего рефералов (все, кто перешёл по ссылке)
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = ?",
+                (user_id,)
+            ) as c:
+                total_refs = (await c.fetchone())[0]
+        
         await message.answer(
             f"👤 *Твой профиль*\n\n"
             f"🆔 ID: `{user['user_id']}`\n"
             f"💰 Баланс: {user['balance']:.1f} ⭐\n"
-            f"👥 Рефералов: {user['referrals_count']}\n"
+            f"👥 Рефералов (всего): {total_refs}\n"
+            f"✅ Активных рефералов: {active_refs}\n"
             f"📊 Всего заработано: {user['total_earned']:.1f} ⭐",
             parse_mode="Markdown"
         )
@@ -1334,15 +1270,15 @@ async def admin_stats(callback: types.CallbackQuery):
             total = (await c.fetchone())[0]
         async with db.execute("SELECT SUM(balance) FROM users") as c:
             total_balance = (await c.fetchone())[0] or 0
-        async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
+        async with db.execute("SELECT value FROM settings WHERE key='sponsor_reward'") as c:
             row = await c.fetchone()
-            ref_reward = row[0] if row else "Не установлена"
+            sponsor_reward = row[0] if row else "Не установлена"
         max_sponsors = await get_max_sponsors()
     await callback.message.edit_text(
         f"📊 *Статистика*\n\n"
         f"👥 Пользователей: {total}\n"
         f"💰 Всего звёзд: {total_balance:.1f}\n"
-        f"⚙ Награда за реферала: {ref_reward} ⭐\n"
+        f"⚙ Награда за спонсора: {sponsor_reward} ⭐\n"
         f"⚙ Максимум спонсоров: {max_sponsors}",
         parse_mode="Markdown",
         reply_markup=admin_keyboard()
@@ -1387,32 +1323,36 @@ async def admin_logs(callback: types.CallbackQuery):
         text += f"• [{date}] {service} → user {user_id}\n"
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
-@dp.callback_query(F.data == "admin_set_reward")
-async def admin_set_reward_start(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "admin_set_sponsor_reward")
+async def admin_set_sponsor_reward_start(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Нет доступа!")
         return
-    await state.set_state(AdminState.waiting_for_reward)
+    await state.set_state(AdminState.waiting_for_sponsor_reward)
+    current = await get_sponsor_reward()
     await callback.message.edit_text(
-        "⚙ *Изменить награду за реферала*\n\n"
-        "Введи новую сумму (например: `5` или `2.5`):",
+        f"⚙ *Награда за одного спонсора*\n\n"
+        f"Введи сумму за 1 подписку реферала (текущая: {current} ⭐):\n"
+        f"Пример: `0.4`",
         parse_mode="Markdown"
     )
 
-@dp.message(AdminState.waiting_for_reward)
-async def admin_set_reward_process(message: types.Message, state: FSMContext):
+@dp.message(AdminState.waiting_for_sponsor_reward)
+async def admin_set_sponsor_reward_process(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     try:
-        reward = float(message.text.replace(",", "."))
+        value = float(message.text.replace(",", "."))
+        if value <= 0:
+            await message.answer("❌ Сумма должна быть больше 0!")
+            return
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ref_reward', ?)", (str(reward),))
+            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('sponsor_reward', ?)", (str(value),))
             await db.commit()
-        await message.answer(f"✅ Награда за реферала обновлена: {reward} ⭐")
+        await message.answer(f"✅ Награда за одного спонсора установлена: {value} ⭐")
         await state.clear()
-    except Exception as e:
-        await message.answer("❌ Ошибка! Введи число. Пример: `5`")
-        logging.error(f"Admin reward error: {e}")
+    except ValueError:
+        await message.answer("❌ Введи число! Пример: `0.4`")
 
 @dp.callback_query(F.data == "admin_give_balance")
 async def admin_give_balance_start(callback: types.CallbackQuery, state: FSMContext):
@@ -1452,102 +1392,6 @@ async def admin_give_balance_process(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer("❌ Ошибка! Формат: `ID СУММА`")
         logging.error(f"Admin balance error: {e}")
-
-@dp.callback_query(F.data == "admin_test_sponsors")
-async def admin_test_sponsors(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа!")
-        return
-    
-    user_id = callback.from_user.id
-    await callback.message.edit_text("🔄 *Тестирую спонсоров...*\n\nЭто может занять до 10 секунд.", parse_mode="Markdown")
-    
-    results = []
-    
-    piarflow = await test_piarflow(user_id)
-    results.append(f"*Piarflow:* {piarflow}")
-    
-    traffy = await test_traffy(user_id)
-    results.append(f"*Traffy:* {traffy}")
-    
-    flyer = await test_flyer(user_id)
-    results.append(f"*Flyer:* {flyer}")
-    
-    tgrass = await test_tgrass(user_id)
-    results.append(f"*TGrass:* {tgrass}")
-    
-    botohub = await test_botohub(user_id)
-    results.append(f"*Botohub:* {botohub}")
-    
-    trafsly = await test_trafsly(user_id)
-    results.append(f"*Trafsly:* {trafsly}")
-    
-    darkboost = await test_darkboost(user_id)
-    results.append(f"*DarkBoost:* {darkboost}")
-    
-    text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
-
-@dp.callback_query(F.data == "admin_test_user")
-async def admin_test_user_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Нет доступа!")
-        return
-    await state.set_state(AdminState.waiting_for_user_id)
-    await callback.message.edit_text(
-        "🔍 *Тест спонсоров для пользователя*\n\n"
-        "Введи Telegram ID пользователя:",
-        parse_mode="Markdown"
-    )
-
-@dp.message(AdminState.waiting_for_user_id)
-async def admin_test_user_process(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Введи число! Пример: `123456789`")
-        return
-    
-    await message.answer(f"🔄 Проверяю спонсоров для `{user_id}`...", parse_mode="Markdown")
-    
-    user = await get_user(user_id)
-    if not user:
-        await message.answer(f"❌ Пользователь `{user_id}` не найден в базе!", parse_mode="Markdown")
-        await state.clear()
-        return
-    
-    results = []
-    
-    piarflow = await test_piarflow(user_id)
-    results.append(f"*Piarflow:* {piarflow}")
-    
-    traffy = await test_traffy(user_id)
-    results.append(f"*Traffy:* {traffy}")
-    
-    flyer = await test_flyer(user_id)
-    results.append(f"*Flyer:* {flyer}")
-    
-    tgrass = await test_tgrass(user_id)
-    results.append(f"*TGrass:* {tgrass}")
-    
-    botohub = await test_botohub(user_id)
-    results.append(f"*Botohub:* {botohub}")
-    
-    trafsly = await test_trafsly(user_id)
-    results.append(f"*Trafsly:* {trafsly}")
-    
-    darkboost = await test_darkboost(user_id)
-    results.append(f"*DarkBoost:* {darkboost}")
-    
-    status_text = "✅ Активирован" if user.get('is_activated') == 1 else "❌ Не активирован"
-    results.append(f"*Статус:* {status_text}")
-    
-    text = f"🔍 *Результаты для пользователя `{user_id}`:*\n\n" + "\n\n".join(results)
-    await message.answer(text, parse_mode="Markdown")
-    await state.clear()
 
 @dp.callback_query(F.data == "admin_set_max_sponsors")
 async def admin_set_max_sponsors_start(callback: types.CallbackQuery, state: FSMContext):
