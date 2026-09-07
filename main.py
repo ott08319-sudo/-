@@ -333,6 +333,62 @@ async def check_botohub_tasks(user_id: int):
         logging.error(f"Botohub check error: {e}")
     return False
 
+# ========== ТЕСТ СПОНСОРОВ ==========
+async def test_piarflow(user_id: int):
+    if not PIARFLOW_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        sponsors = await get_piarflow_sponsors(user_id, user_id, 5)
+        if sponsors:
+            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
+        return "❌ 0 спонсоров (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
+async def test_traffy(user_id: int):
+    if not TRAFFY_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        tasks = await get_traffy_tasks(user_id, 5)
+        if tasks:
+            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t.get('target_link')}" for t in tasks[:5]])
+        return "❌ 0 заданий (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
+async def test_flyer(user_id: int):
+    if not FLYER_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        tasks = await get_flyer_tasks(user_id, "ru")
+        if tasks:
+            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t.get('link')}" for t in tasks[:5]])
+        return "❌ 0 заданий (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
+async def test_tgrass(user_id: int):
+    if not TGRASS_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        offers = await get_tgrass_offers(user_id, "test", "ru", False)
+        if offers:
+            return f"✅ {len(offers)} офферов:\n" + "\n".join([f"  • {o.get('link')}" for o in offers[:5]])
+        return "❌ 0 офферов (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
+async def test_botohub(user_id: int):
+    if not BOTOHUB_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        tasks = await get_botohub_tasks(user_id)
+        if tasks:
+            return f"✅ {len(tasks)} заданий:\n" + "\n".join([f"  • {t}" for t in tasks[:5]])
+        return "❌ 0 заданий (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
 # ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
@@ -442,7 +498,7 @@ async def check_all_subscriptions(user_id: int):
     if piarflow_links:
         results = await check_piarflow_sponsors(user_id, piarflow_links)
         for r in results:
-            if r.get("status") not in ["subscribed", "not_counted"]:  # ← ФИКС
+            if r.get("status") not in ["subscribed", "not_counted"]:
                 all_done = False
     
     if traffy_ids:
@@ -783,6 +839,7 @@ async def admin_panel(message: types.Message):
     kb.row(types.InlineKeyboardButton(text="📋 Логи спонсоров", callback_data="admin_logs"))
     kb.row(types.InlineKeyboardButton(text="⚙ Награда за реферала", callback_data="admin_set_reward"))
     kb.row(types.InlineKeyboardButton(text="💰 Выдать/забрать баланс", callback_data="admin_give_balance"))
+    kb.row(types.InlineKeyboardButton(text="🧪 Тест спонсоров", callback_data="admin_test_sponsors"))
     kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
     await message.answer("👑 *Админ-панель*", reply_markup=kb.as_markup(), parse_mode="Markdown")
 
@@ -911,6 +968,40 @@ async def admin_give_balance_process(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer("❌ Ошибка! Формат: `ID СУММА`")
         logging.error(f"Admin balance error: {e}")
+
+@dp.callback_query(F.data == "admin_test_sponsors")
+async def admin_test_sponsors(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    
+    user_id = callback.from_user.id
+    await callback.message.edit_text("🔄 *Тестирую спонсоров...*\n\nЭто может занять до 10 секунд.", parse_mode="Markdown")
+    
+    results = []
+    
+    # Piarflow
+    piarflow = await test_piarflow(user_id)
+    results.append(f"*Piarflow:* {piarflow}")
+    
+    # Traffy
+    traffy = await test_traffy(user_id)
+    results.append(f"*Traffy:* {traffy}")
+    
+    # Flyer
+    flyer = await test_flyer(user_id)
+    results.append(f"*Flyer:* {flyer}")
+    
+    # TGrass
+    tgrass = await test_tgrass(user_id)
+    results.append(f"*TGrass:* {tgrass}")
+    
+    # Botohub
+    botohub = await test_botohub(user_id)
+    results.append(f"*Botohub:* {botohub}")
+    
+    text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
+    await callback.message.edit_text(text, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_close")
 async def admin_close(callback: types.CallbackQuery):
