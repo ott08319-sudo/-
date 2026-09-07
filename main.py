@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -30,7 +29,7 @@ BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 TRAFSLY_API_KEY = os.getenv("TRAFSLY_API_KEY", "")
 
 DB_PATH = "bot.db"
-MAX_SPONSORS = 20
+DEFAULT_MAX_SPONSORS = 20
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -40,11 +39,7 @@ class AdminState(StatesGroup):
     waiting_for_reward = State()
     waiting_for_balance = State()
     waiting_for_user_id = State()
-
-class PhotoState(StatesGroup):
-    waiting_for_photo = State()
-    waiting_for_price = State()
-    waiting_for_description = State()
+    waiting_for_max_sponsors = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
@@ -70,6 +65,7 @@ async def init_db():
             link TEXT,
             status TEXT DEFAULT 'unsubscribed',
             signature TEXT,
+            need_check INTEGER DEFAULT 1,
             created_at REAL,
             UNIQUE(user_id, service, assignment_id)
         )""")
@@ -95,16 +91,13 @@ async def init_db():
             value TEXT
         )""")
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS photos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            file_id TEXT,
-            price REAL,
-            description TEXT,
-            status TEXT DEFAULT 'active',
-            created_at REAL
+        CREATE TABLE IF NOT EXISTS sponsor_cache (
+            cache_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            expires_at REAL NOT NULL
         )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_sponsors', '20')")
         await db.commit()
 
 async def get_user(user_id: int):
@@ -119,6 +112,12 @@ async def get_ref_reward():
         async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
             row = await c.fetchone()
             return float(row[0]) if row else 3.0
+
+async def get_max_sponsors():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key='max_sponsors'") as c:
+            row = await c.fetchone()
+            return int(row[0]) if row else DEFAULT_MAX_SPONSORS
 
 async def register_user(user_id: int, username: str, referrer_id: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -173,7 +172,7 @@ async def db_execute(query, params):
         await db.commit()
 
 # ========== API СПОНСОРОВ ==========
-async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = MAX_SPONSORS):
+async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = DEFAULT_MAX_SPONSORS):
     if not PIARFLOW_API_KEY:
         return []
     url = "https://piarflow.com/v1/sponsors"
@@ -211,7 +210,7 @@ async def get_flyer_tasks(user_id: int, language_code: str = "ru"):
     if not FLYER_API_KEY:
         return []
     url = "https://api.flyerhubs.com/v1/tasks"
-    payload = {"key": FLYER_API_KEY, "user_id": user_id, "language_code": language_code, "limit": MAX_SPONSORS}
+    payload = {"key": FLYER_API_KEY, "user_id": user_id, "language_code": language_code, "limit": DEFAULT_MAX_SPONSORS}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10) as resp:
@@ -272,7 +271,7 @@ async def check_tgrass_subscription(user_id: int):
         logging.error(f"TGrass check error: {e}")
     return False
 
-async def get_traffy_tasks(user_id: int, limit: int = MAX_SPONSORS, first_name: str = None, username: str = None, language_code: str = "ru"):
+async def get_traffy_tasks(user_id: int, limit: int = DEFAULT_MAX_SPONSORS, first_name: str = None, username: str = None, language_code: str = "ru"):
     if not TRAFFY_API_KEY:
         return []
     url = "https://traffy.ai/publisher/tasks"
@@ -343,7 +342,7 @@ async def check_botohub_tasks(user_id: int):
     return False
 
 # ========== TRAFSLY API ==========
-async def get_trafsly_sponsors(user_id: int, chat_id: int = None, first_name: str = None, username: str = None, language_code: str = "ru", is_premium: bool = False, max_sponsors: int = MAX_SPONSORS):
+async def get_trafsly_sponsors(user_id: int, chat_id: int = None, first_name: str = None, username: str = None, language_code: str = "ru", is_premium: bool = False, max_sponsors: int = DEFAULT_MAX_SPONSORS):
     if not TRAFSLY_API_KEY:
         return []
     
@@ -379,12 +378,13 @@ async def get_trafsly_sponsors(user_id: int, chat_id: int = None, first_name: st
                         sponsors = data.get("sponsors", [])
                         async with aiosqlite.connect(DB_PATH) as db:
                             for s in sponsors:
-                                ads_id = s.get("ads_id")
                                 link = s.get("link")
-                                if link and ads_id:
+                                ads_id = s.get("ads_id")
+                                need_check = 1 if ads_id else 0
+                                if link:
                                     await db.execute(
-                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                        (user_id, "trafsly", str(ads_id), link, "unsubscribed", time.time())
+                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, need_check, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                        (user_id, "trafsly", str(ads_id) if ads_id else link, link, "unsubscribed", need_check, time.time())
                                     )
                             await db.commit()
                         return sponsors
@@ -521,13 +521,23 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     first_name = user.first_name or ""
     lang = user.language_code or "ru"
     is_premium = user.is_premium or False
+    max_sponsors = await get_max_sponsors()
     
     all_sponsors = []
+    
+    if not force_refresh:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT payload, expires_at FROM sponsor_cache WHERE cache_key = ?", (f"all_sponsors_{user_id}",)) as c:
+                row = await c.fetchone()
+                if row:
+                    payload, expires_at = row
+                    if expires_at > time.time():
+                        return json.loads(payload)
     
     logging.info(f"Запрос спонсоров для {user_id}")
     
     # Piarflow
-    piarflow = await get_piarflow_sponsors(user_id, user_id, MAX_SPONSORS)
+    piarflow = await get_piarflow_sponsors(user_id, user_id, max_sponsors)
     for s in piarflow:
         await log_sponsor(user_id, "piarflow", s.get("link"), "выдан")
         await db_execute(
@@ -557,7 +567,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     all_sponsors.extend(tgrass)
     
     # Traffy
-    traffy = await get_traffy_tasks(user_id, MAX_SPONSORS, first_name, username, lang)
+    traffy = await get_traffy_tasks(user_id, max_sponsors, first_name, username, lang)
     for s in traffy:
         await log_sponsor(user_id, "traffy", s.get("target_link"), "выдан")
         await db_execute(
@@ -578,7 +588,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     
     # Trafsly
     trafsly = await get_trafsly_sponsors(
-        user_id, user_id, first_name, username, lang, is_premium, MAX_SPONSORS
+        user_id, user_id, first_name, username, lang, is_premium, max_sponsors
     )
     for s in trafsly:
         await log_sponsor(user_id, "trafsly", s.get("link"), "выдан")
@@ -590,6 +600,12 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         await log_sponsor_status(user_id, "not_issued", "Нет активных заданий")
     else:
         await log_sponsor_status(user_id, "issued", f"Выдано {len(all_sponsors)} спонсоров")
+    
+    if all_sponsors:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO sponsor_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
+                (f"all_sponsors_{user_id}", json.dumps(all_sponsors), time.time() + 300))
+            await db.commit()
     
     return all_sponsors
 
@@ -685,16 +701,20 @@ async def check_sponsors_before_action(message: types.Message):
     sponsors = await get_all_sponsors(message.from_user)
     
     if sponsors:
-        await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
+        await message.answer(
+            "📌 *Выполни задания для доступа к боту:*",
+            reply_markup=sponsors_keyboard(sponsors, 1),
+            parse_mode="Markdown"
+        )
         return False
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
             await db.commit()
-        await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
+        await message.answer("🎉 *Добро пожаловать!*", reply_markup=main_menu(), parse_mode="Markdown")
         return True
 
-# ========== МЕНЮ ==========
+# ========== КЛАВИАТУРЫ ==========
 def main_menu():
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -705,21 +725,46 @@ def main_menu():
         types.KeyboardButton(text="🎁 Бонус"),
         types.KeyboardButton(text="💎 Вывод")
     )
-    builder.row(
-        types.KeyboardButton(text="📸 Фотобот"),
-        types.KeyboardButton(text="👑 Админ")
-    )
+    builder.row(types.KeyboardButton(text="👑 Админ"))
     return builder.as_markup(resize_keyboard=True)
 
-def sponsors_keyboard(sponsors):
+def sponsors_keyboard(sponsors, page=1):
     builder = InlineKeyboardBuilder()
-    for idx, sp in enumerate(sponsors[:MAX_SPONSORS], 1):
+    
+    per_page = 15
+    total_pages = (len(sponsors) + per_page - 1) // per_page if sponsors else 1
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_sponsors = sponsors[start:end]
+    
+    row_buttons = []
+    for sp in page_sponsors:
+        if not isinstance(sp, dict):
+            continue
         link = sp.get("link") or sp.get("target_link")
-        if link:
-            builder.row(types.InlineKeyboardButton(
-                text=f"📢 Подписаться #{idx}",
+        if link and link.startswith("http"):
+            row_buttons.append(types.InlineKeyboardButton(
+                text=f"📢 Подписаться",
                 url=link
             ))
+    
+    for i in range(0, len(row_buttons), 2):
+        builder.row(*row_buttons[i:i+2])
+    
+    nav_row = []
+    if page > 1:
+        nav_row.append(types.InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"sponsors_page_{page - 1}"
+        ))
+    if page < total_pages:
+        nav_row.append(types.InlineKeyboardButton(
+            text="➡️ Далее",
+            callback_data=f"sponsors_page_{page + 1}"
+        ))
+    if nav_row:
+        builder.row(*nav_row)
+    
     builder.row(types.InlineKeyboardButton(
         text="✅ Проверить",
         callback_data="check_subs"
@@ -742,8 +787,9 @@ def admin_keyboard():
     )
     builder.row(
         types.InlineKeyboardButton(text="🔍 Тест для юзера", callback_data="admin_test_user"),
-        types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")
+        types.InlineKeyboardButton(text="⚙ Максимум спонсоров", callback_data="admin_set_max_sponsors")
     )
+    builder.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
     return builder.as_markup()
 
 def withdraw_keyboard():
@@ -773,7 +819,7 @@ async def start_cmd(message: types.Message):
     if sponsors:
         await message.answer(
             "📌 *Выполни задания для доступа к боту:*",
-            reply_markup=sponsors_keyboard(sponsors),
+            reply_markup=sponsors_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
     else:
@@ -862,24 +908,28 @@ async def check_subs(callback: types.CallbackQuery):
             )
             await db.commit()
     
-    # 6. Trafsly — только числовые ID
+    # 6. Trafsly
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
+            "SELECT assignment_id, need_check FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
             (user_id,)
         ) as c:
             trafsly_tasks = await c.fetchall()
     
     if trafsly_tasks:
-        assignment_ids = []
-        for row in trafsly_tasks:
-            try:
-                assignment_ids.append(int(row[0]))
-            except ValueError:
-                logging.warning(f"Пропускаем нечисловой ID для Trafsly: {row[0]}")
-                continue
-        if assignment_ids:
-            await check_trafsly_sponsors(user_id, assignment_ids)
+        for assignment_id, need_check in trafsly_tasks:
+            if need_check == 0:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
+                        (user_id, assignment_id)
+                    )
+                    await db.commit()
+            else:
+                try:
+                    await check_trafsly_sponsors(user_id, [int(assignment_id)])
+                except:
+                    pass
     
     # ФИНАЛЬНАЯ ПРОВЕРКА
     async with aiosqlite.connect(DB_PATH) as db:
@@ -904,7 +954,34 @@ async def check_subs(callback: types.CallbackQuery):
         user = types.User(id=user_id, is_bot=False, first_name="User", last_name=None, username=None, language_code="ru")
         sponsors = await get_all_sponsors(user, force_refresh=True)
         if sponsors:
-            await callback.message.edit_reply_markup(reply_markup=sponsors_keyboard(sponsors))
+            await callback.message.edit_reply_markup(
+                reply_markup=sponsors_keyboard(sponsors, 1)
+            )
+
+@dp.callback_query(F.data.startswith("sponsors_page_"))
+async def sponsors_page(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT payload FROM sponsor_cache WHERE cache_key = ?",
+            (f"all_sponsors_{user_id}",)
+        ) as c:
+            row = await c.fetchone()
+    
+    if not row:
+        await callback.answer("❌ Спонсоры устарели, обновите страницу!")
+        return
+    
+    sponsors = json.loads(row[0])
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=sponsors_keyboard(sponsors, page)
+        )
+    except Exception as e:
+        await callback.answer("❌ Ошибка при переключении страницы!")
+    await callback.answer()
 
 @dp.message(F.text == "👤 Профиль")
 async def profile_cmd(message: types.Message):
@@ -1002,215 +1079,6 @@ async def process_withdraw(callback: types.CallbackQuery):
         except:
             pass
 
-# ========== ФОТОБОТ ==========
-@dp.message(F.text == "📸 Фотобот")
-async def photo_bot_menu(message: types.Message):
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        types.InlineKeyboardButton(text="📤 Выставить фото", callback_data="photo_sell"),
-        types.InlineKeyboardButton(text="🖼 Галерея", callback_data="photo_gallery")
-    )
-    kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="photo_close"))
-    await message.answer(
-        "📸 *Фотобот*\n\n"
-        "Здесь ты можешь продавать и покупать фотографии за звёзды.\n\n"
-        "Выбери действие:",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "photo_sell")
-async def photo_sell_start(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(PhotoState.waiting_for_photo)
-    await callback.message.edit_text(
-        "📤 *Выставить фото*\n\n"
-        "Отправь мне фотографию, которую хочешь продать:",
-        parse_mode="Markdown"
-    )
-
-@dp.message(PhotoState.waiting_for_photo)
-async def photo_sell_photo(message: types.Message, state: FSMContext):
-    if not message.photo:
-        await message.answer("❌ Отправь именно фотографию!")
-        return
-    
-    file_id = message.photo[-1].file_id
-    await state.update_data(file_id=file_id)
-    await state.set_state(PhotoState.waiting_for_price)
-    await message.answer(
-        "💰 Теперь введи цену в звёздах (например: `10`):",
-        parse_mode="Markdown"
-    )
-
-@dp.message(PhotoState.waiting_for_price)
-async def photo_sell_price(message: types.Message, state: FSMContext):
-    try:
-        price = float(message.text.replace(",", "."))
-        if price <= 0:
-            await message.answer("❌ Цена должна быть больше 0!")
-            return
-        await state.update_data(price=price)
-        await state.set_state(PhotoState.waiting_for_description)
-        await message.answer(
-            "📝 Введи описание для фото (можно пропустить, отправь `-`):",
-            parse_mode="Markdown"
-        )
-    except ValueError:
-        await message.answer("❌ Введи число! Пример: `10`")
-
-@dp.message(PhotoState.waiting_for_description)
-async def photo_sell_description(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    description = message.text if message.text != "-" else ""
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO photos (user_id, file_id, price, description, created_at) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, data["file_id"], data["price"], description, time.time())
-        )
-        await db.commit()
-    
-    await state.clear()
-    await message.answer(
-        f"✅ *Фото выставлено на продажу!*\n\n"
-        f"💰 Цена: {data['price']} ⭐\n"
-        f"📝 Описание: {description or 'Нет'}\n\n"
-        f"Ожидай покупателя!",
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data == "photo_gallery")
-async def photo_gallery(callback: types.CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, user_id, file_id, price, description FROM photos WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
-        ) as c:
-            photos = await c.fetchall()
-    
-    if not photos:
-        await callback.message.edit_text(
-            "🖼 *Галерея*\n\nПока нет фотографий в продаже.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    kb = InlineKeyboardBuilder()
-    for photo_id, user_id, file_id, price, description in photos:
-        kb.row(types.InlineKeyboardButton(
-            text=f"🖼 Фото #{photo_id} — {price} ⭐",
-            callback_data=f"photo_view_{photo_id}"
-        ))
-    kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_back"))
-    
-    await callback.message.edit_text(
-        "🖼 *Галерея*\n\n"
-        "Выбери фото для просмотра. *Оно замазано* — купи, чтобы увидеть оригинал!",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data.startswith("photo_view_"))
-async def photo_view(callback: types.CallbackQuery):
-    photo_id = int(callback.data.split("_")[2])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, file_id, price, description FROM photos WHERE id = ? AND status = 'active'",
-            (photo_id,)
-        ) as c:
-            photo = await c.fetchone()
-    
-    if not photo:
-        await callback.answer("❌ Фото уже продано или удалено!", show_alert=True)
-        return
-    
-    user_id, file_id, price, description = photo
-    
-    kb = InlineKeyboardBuilder()
-    if callback.from_user.id != user_id:
-        kb.row(types.InlineKeyboardButton(
-            text=f"💎 Купить за {price} ⭐",
-            callback_data=f"photo_buy_{photo_id}"
-        ))
-    kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_gallery"))
-    
-    await bot.send_photo(
-        callback.from_user.id,
-        file_id,
-        caption=f"🖼 *Фото #{photo_id}*\n\n"
-                f"💰 Цена: {price} ⭐\n"
-                f"📝 Описание: {description or 'Нет'}\n"
-                f"👤 Продавец: ID {user_id}\n\n"
-                f"🔒 *Фото замазано. Купи, чтобы увидеть оригинал!*",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("photo_buy_"))
-async def photo_buy(callback: types.CallbackQuery):
-    photo_id = int(callback.data.split("_")[2])
-    buyer_id = callback.from_user.id
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, file_id, price, description FROM photos WHERE id = ? AND status = 'active'",
-            (photo_id,)
-        ) as c:
-            photo = await c.fetchone()
-        
-        if not photo:
-            await callback.answer("❌ Фото уже продано!", show_alert=True)
-            return
-        
-        seller_id, file_id, price, description = photo
-        
-        if buyer_id == seller_id:
-            await callback.answer("❌ Нельзя купить своё же фото!", show_alert=True)
-            return
-        
-        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (buyer_id,)) as c:
-            buyer = await c.fetchone()
-        
-        if not buyer or buyer[0] < price:
-            await callback.answer(f"❌ Недостаточно средств! Нужно {price} ⭐", show_alert=True)
-            return
-        
-        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, buyer_id))
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (price, seller_id))
-        await db.execute("UPDATE photos SET status = 'sold' WHERE id = ?", (photo_id,))
-        await db.commit()
-    
-    await callback.answer("✅ Покупка успешна!", show_alert=True)
-    
-    await bot.send_photo(
-        buyer_id,
-        file_id,
-        caption=f"🖼 *Ты купил фото #{photo_id}!*\n\n"
-                f"💰 Цена: {price} ⭐\n"
-                f"📝 Описание: {description or 'Нет'}\n"
-                f"👤 Продавец: ID {seller_id}",
-        parse_mode="Markdown"
-    )
-    
-    try:
-        await bot.send_message(
-            seller_id,
-            f"🎉 *Твоё фото #{photo_id} купили за {price} ⭐!*\n"
-            f"Деньги зачислены на баланс.",
-            parse_mode="Markdown"
-        )
-    except:
-        pass
-
-@dp.callback_query(F.data == "photo_back")
-async def photo_back(callback: types.CallbackQuery):
-    await photo_bot_menu(callback.message)
-
-@dp.callback_query(F.data == "photo_close")
-async def photo_close(callback: types.CallbackQuery):
-    await callback.message.delete()
-
 # ========== АДМИН-ПАНЕЛЬ ==========
 @dp.message(F.text == "👑 Админ")
 @dp.message(Command("admin"))
@@ -1239,11 +1107,13 @@ async def admin_stats(callback: types.CallbackQuery):
         async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
             row = await c.fetchone()
             ref_reward = row[0] if row else "Не установлена"
+        max_sponsors = await get_max_sponsors()
     await callback.message.edit_text(
         f"📊 *Статистика*\n\n"
         f"👥 Пользователей: {total}\n"
         f"💰 Всего звёзд: {total_balance:.1f}\n"
-        f"⚙ Награда за реферала: {ref_reward} ⭐",
+        f"⚙ Награда за реферала: {ref_reward} ⭐\n"
+        f"⚙ Максимум спонсоров: {max_sponsors}",
         parse_mode="Markdown",
         reply_markup=admin_keyboard()
     )
@@ -1442,6 +1312,36 @@ async def admin_test_user_process(message: types.Message, state: FSMContext):
     text = f"🔍 *Результаты для пользователя `{user_id}`:*\n\n" + "\n\n".join(results)
     await message.answer(text, parse_mode="Markdown")
     await state.clear()
+
+@dp.callback_query(F.data == "admin_set_max_sponsors")
+async def admin_set_max_sponsors_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    await state.set_state(AdminState.waiting_for_max_sponsors)
+    current_max = await get_max_sponsors()
+    await callback.message.edit_text(
+        f"⚙ *Максимум спонсоров*\n\n"
+        f"Введи число от 1 до 50 (текущий: {current_max}):",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminState.waiting_for_max_sponsors)
+async def admin_set_max_sponsors_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        value = int(message.text.strip())
+        if value < 1 or value > 50:
+            await message.answer("❌ Введи число от 1 до 50!")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('max_sponsors', ?)", (str(value),))
+            await db.commit()
+        await message.answer(f"✅ Максимум спонсоров установлен: {value}")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введи целое число!")
 
 @dp.callback_query(F.data == "admin_close")
 async def admin_close(callback: types.CallbackQuery):
