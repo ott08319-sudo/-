@@ -28,13 +28,18 @@ TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
 BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
 
 DB_PATH = "bot.db"
-MAX_SPONSORS = 20  # ← БЕЗЛИМИТ (можно менять)
+MAX_SPONSORS = 20
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# ========== FSM ==========
 class CasinoState(StatesGroup):
     waiting_for_bet = State()
+
+class AdminState(StatesGroup):
+    waiting_for_reward = State()
+    waiting_for_balance = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
@@ -85,6 +90,12 @@ async def init_db():
             reason TEXT,
             updated_at REAL
         )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
         await db.commit()
 
 async def get_user(user_id: int):
@@ -93,6 +104,12 @@ async def get_user(user_id: int):
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as c:
             row = await c.fetchone()
             return dict(row) if row else None
+
+async def get_ref_reward():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
+            row = await c.fetchone()
+            return float(row[0]) if row else 3.0
 
 async def register_user(user_id: int, username: str, referrer_id: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -105,13 +122,14 @@ async def register_user(user_id: int, username: str, referrer_id: int = None):
             (user_id, username, referrer_id, now)
         )
         if referrer_id and referrer_id != user_id:
+            reward = await get_ref_reward()
             await db.execute("""
                 UPDATE users 
-                SET balance = balance + 3.0, 
-                    total_earned = total_earned + 3.0, 
+                SET balance = balance + ?, 
+                    total_earned = total_earned + ?, 
                     referrals_count = referrals_count + 1 
                 WHERE user_id = ?
-            """, (referrer_id,))
+            """, (reward, reward, referrer_id))
         await db.commit()
 
 async def update_balance(user_id: int, amount: float):
@@ -140,7 +158,12 @@ async def log_sponsor_status(user_id: int, status: str, reason: str = ""):
         )
         await db.commit()
 
-# ========== API СПОНСОРОВ (С ЛИМИТОМ 20) ==========
+async def db_execute(query, params):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(query, params)
+        await db.commit()
+
+# ========== API СПОНСОРОВ ==========
 async def get_piarflow_sponsors(user_id: int, chat_id: int, max_sponsors: int = MAX_SPONSORS):
     if not PIARFLOW_API_KEY:
         return []
@@ -310,7 +333,7 @@ async def check_botohub_tasks(user_id: int):
         logging.error(f"Botohub check error: {e}")
     return False
 
-# ========== ОСНОВНАЯ ЛОГИКА СПОНСОРОВ ==========
+# ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
     username = user.username or ""
@@ -395,11 +418,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
             await db.commit()
     
     return all_sponsors
-
-async def db_execute(query, params):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(query, params)
-        await db.commit()
 
 async def check_all_subscriptions(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -519,7 +537,58 @@ async def start_cmd(message: types.Message):
 
 @dp.callback_query(F.data == "check_subs")
 async def check_subs(callback: types.CallbackQuery):
-    if await activate_user(callback.from_user.id):
+    user_id = callback.from_user.id
+    await callback.answer("🔄 Проверяю подписки...")
+    
+    # 1. Принудительно проверяем Piarflow
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT link FROM sponsor_tasks WHERE user_id = ? AND service = 'piarflow' AND status != 'subscribed'", (user_id,)) as c:
+            piarflow_tasks = await c.fetchall()
+    
+    if piarflow_tasks:
+        links = [t[0] for t in piarflow_tasks]
+        results = await check_piarflow_sponsors(user_id, links)
+        logging.info(f"Piarflow проверка: {results}")
+    
+    # 2. Принудительно проверяем Flyer
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT signature FROM sponsor_tasks WHERE user_id = ? AND service = 'flyer' AND status != 'subscribed'", (user_id,)) as c:
+            flyer_tasks = await c.fetchall()
+    
+    for row in flyer_tasks:
+        signature = row[0]
+        if signature:
+            done = await check_flyer_task(user_id, signature)
+            if done:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?", (user_id, signature))
+                    await db.commit()
+    
+    # 3. Принудительно проверяем TGrass
+    tgrass_done = await check_tgrass_subscription(user_id)
+    if tgrass_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'", (user_id,))
+            await db.commit()
+    
+    # 4. Принудительно проверяем Traffy
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'traffy' AND status != 'subscribed'", (user_id,)) as c:
+            traffy_tasks = await c.fetchall()
+    
+    if traffy_tasks:
+        assignment_ids = [t[0] for t in traffy_tasks]
+        await check_traffy_tasks(user_id, assignment_ids)
+    
+    # 5. Принудительно проверяем Botohub
+    botohub_done = await check_botohub_tasks(user_id)
+    if botohub_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'", (user_id,))
+            await db.commit()
+    
+    # 6. Проверяем, всё ли выполнено
+    if await activate_user(user_id):
         await callback.message.delete()
         await callback.message.answer("🎉 Все задания выполнены!", reply_markup=main_menu())
     else:
@@ -548,8 +617,10 @@ async def earn_stars(message: types.Message):
         await message.answer("❌ Сначала выполни задания через /start!")
         return
     bot_info = await bot.get_me()
+    reward = await get_ref_reward()
     await message.answer(
-        f"🔗 Твоя реферальная ссылка:\nhttps://t.me/{bot_info.username}?start={user_id}\n\nПриглашай друзей и получай 3 ⭐ за каждого!",
+        f"🔗 Твоя реферальная ссылка:\nhttps://t.me/{bot_info.username}?start={user_id}\n\n"
+        f"Приглашай друзей и получай {reward} ⭐ за каждого!",
         parse_mode="Markdown"
     )
 
@@ -603,7 +674,6 @@ async def casino_choice(callback: types.CallbackQuery, state: FSMContext):
     choice = "чёт" if callback.data == "casino_even" else "нечет"
     await state.update_data(choice=choice)
     await state.set_state(CasinoState.waiting_for_bet)
-    
     await callback.message.edit_text(
         f"🎲 Ты выбрал *{choice}*\n\nТеперь введи сумму ставки (например: `10`):",
         parse_mode="Markdown"
@@ -615,34 +685,28 @@ async def casino_bet(message: types.Message, state: FSMContext):
     try:
         amount_text = message.text.replace(",", ".").strip()
         amount_text = ''.join(c for c in amount_text if c.isdigit() or c == '.')
-        
         if not amount_text:
             await message.answer("❌ Введи число! Пример: `10`")
             return
-        
         amount = float(amount_text)
         if amount <= 0:
             await message.answer("❌ Сумма должна быть больше 0!")
             return
-        
         user_id = message.from_user.id
         user = await get_user(user_id)
         if not user or user["balance"] < amount:
             await message.answer(f"❌ Недостаточно средств! Твой баланс: {user['balance']:.1f} ⭐")
             return
-        
         data = await state.get_data()
         choice = data.get("choice")
         if not choice:
             await message.answer("❌ Ошибка! Начни заново: /start")
             await state.clear()
             return
-        
         await update_balance(user_id, -amount)
         roll = random.randint(1, 6)
         is_even = roll % 2 == 0
         win = (choice == "чёт" and is_even) or (choice == "нечет" and not is_even)
-        
         if win:
             win_amount = amount * 1.9
             await update_balance(user_id, win_amount)
@@ -655,9 +719,7 @@ async def casino_bet(message: types.Message, state: FSMContext):
                 f"🎲 *Результат:* {roll}\n\n❌ Ты проиграл! -{amount:.1f} ⭐\n💰 Новый баланс: {user['balance'] - amount:.1f} ⭐",
                 parse_mode="Markdown"
             )
-        
         await state.clear()
-        
     except Exception as e:
         await message.answer("❌ Ошибка! Введи число. Пример: `10`")
         logging.error(f"Casino error: {e}")
@@ -713,6 +775,8 @@ async def admin_panel(message: types.Message):
     kb.row(types.InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
     kb.row(types.InlineKeyboardButton(text="📋 Статус спонсоров", callback_data="admin_sponsor_status"))
     kb.row(types.InlineKeyboardButton(text="📋 Логи спонсоров", callback_data="admin_logs"))
+    kb.row(types.InlineKeyboardButton(text="⚙ Награда за реферала", callback_data="admin_set_reward"))
+    kb.row(types.InlineKeyboardButton(text="💰 Выдать/забрать баланс", callback_data="admin_give_balance"))
     kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
     await message.answer("👑 *Админ-панель*", reply_markup=kb.as_markup(), parse_mode="Markdown")
 
@@ -726,8 +790,14 @@ async def admin_stats(callback: types.CallbackQuery):
             total = (await c.fetchone())[0]
         async with db.execute("SELECT SUM(balance) FROM users") as c:
             total_balance = (await c.fetchone())[0] or 0
+        async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
+            row = await c.fetchone()
+            ref_reward = row[0] if row else "Не установлена"
     await callback.message.edit_text(
-        f"📊 *Статистика*\n\n👥 Пользователей: {total}\n💰 Всего звёзд: {total_balance:.1f}",
+        f"📊 *Статистика*\n\n"
+        f"👥 Пользователей: {total}\n"
+        f"💰 Всего звёзд: {total_balance:.1f}\n"
+        f"⚙ Награда за реферала: {ref_reward} ⭐",
         parse_mode="Markdown"
     )
 
@@ -736,17 +806,14 @@ async def admin_sponsor_status(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("❌ Нет доступа!")
         return
-    
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT user_id, status, reason, updated_at FROM sponsor_status ORDER BY updated_at DESC LIMIT 20"
         ) as c:
             rows = await c.fetchall()
-    
     if not rows:
         await callback.message.edit_text("📋 *Статус спонсоров:*\n\nНет данных.", parse_mode="Markdown")
         return
-    
     text = "📋 *Статус спонсоров (последние 20):*\n\n"
     for user_id, status, reason, updated_at in rows:
         date = datetime.fromtimestamp(updated_at).strftime("%d.%m %H:%M")
@@ -754,7 +821,6 @@ async def admin_sponsor_status(callback: types.CallbackQuery):
         text += f"{emoji} [{date}] ID {user_id} → *{status}*\n"
         if reason:
             text += f"   📌 {reason}\n"
-    
     await callback.message.edit_text(text, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_logs")
@@ -773,6 +839,72 @@ async def admin_logs(callback: types.CallbackQuery):
         date = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
         text += f"• [{date}] {service} → user {user_id}\n"
     await callback.message.edit_text(text, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_set_reward")
+async def admin_set_reward_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    await state.set_state(AdminState.waiting_for_reward)
+    await callback.message.edit_text(
+        "⚙ *Изменить награду за реферала*\n\n"
+        "Введи новую сумму (например: `5` или `2.5`):",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminState.waiting_for_reward)
+async def admin_set_reward_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        reward = float(message.text.replace(",", "."))
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ref_reward', ?)", (str(reward),))
+            await db.commit()
+        await message.answer(f"✅ Награда за реферала обновлена: {reward} ⭐")
+        await state.clear()
+    except Exception as e:
+        await message.answer("❌ Ошибка! Введи число. Пример: `5`")
+        logging.error(f"Admin reward error: {e}")
+
+@dp.callback_query(F.data == "admin_give_balance")
+async def admin_give_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    await state.set_state(AdminState.waiting_for_balance)
+    await callback.message.edit_text(
+        "💰 *Выдать или забрать баланс*\n\n"
+        "Введи `ID_ПОЛЬЗОВАТЕЛЯ СУММА`\n"
+        "Для списания используй отрицательное число.\n\n"
+        "Пример: `123456789 10` или `123456789 -5`",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminState.waiting_for_balance)
+async def admin_give_balance_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.strip().split()
+        user_id = int(parts[0])
+        amount = float(parts[1].replace(",", "."))
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as c:
+                row = await c.fetchone()
+                if not row:
+                    await message.answer("❌ Пользователь не найден!")
+                    await state.clear()
+                    return
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+            await db.commit()
+        
+        await message.answer(f"✅ Баланс пользователя `{user_id}` изменён на `{amount}` ⭐")
+        await state.clear()
+    except Exception as e:
+        await message.answer("❌ Ошибка! Формат: `ID СУММА`")
+        logging.error(f"Admin balance error: {e}")
 
 @dp.callback_query(F.data == "admin_close")
 async def admin_close(callback: types.CallbackQuery):
