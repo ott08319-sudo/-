@@ -111,11 +111,13 @@ async def init_db():
             created_at REAL
         )""")
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS daily_earnings (
+        CREATE TABLE IF NOT EXISTS manual_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            date TEXT,
-            earned REAL DEFAULT 0.0,
-            PRIMARY KEY (user_id, date)
+            username TEXT,
+            sponsors TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at REAL
         )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_sponsors', '20')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_reward', '0.5')")
@@ -160,15 +162,6 @@ async def update_balance(user_id: int, amount: float):
                 total_earned = total_earned + CASE WHEN ? > 0 THEN ? ELSE 0 END 
             WHERE user_id = ?
         """, (amount, amount, amount, user_id))
-        
-        if amount > 0:
-            today = datetime.now().date().isoformat()
-            await db.execute("""
-                INSERT INTO daily_earnings (user_id, date, earned) 
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, date) DO UPDATE SET earned = earned + ?
-            """, (user_id, today, amount, amount))
-        
         await db.commit()
 
 async def log_sponsor(user_id: int, service: str, link: str, status: str):
@@ -654,7 +647,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         await log_sponsor(user_id, "darkboost", s.get("link"), "выдан")
     all_sponsors.extend(darkboost)
     
-    # Обрезаем по общему лимиту
     all_sponsors = all_sponsors[:max_sponsors]
     
     logging.info(f"Всего спонсоров: {len(all_sponsors)}")
@@ -730,7 +722,6 @@ async def check_all_subscriptions(user_id: int):
             else:
                 all_done = False
     
-    # DarkBoost
     darkboost_done = await check_darkboost_sponsors(user_id)
     if darkboost_done:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -749,7 +740,6 @@ async def check_all_subscriptions(user_id: int):
                 if count and count[0] > 0:
                     all_done = False
     
-    # Trafsly (задания без проверки)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT assignment_id, need_check FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
@@ -849,8 +839,8 @@ async def check_sponsors_before_action(message: types.Message):
     
     if sponsors:
         await message.answer(
-            "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
-            reply_markup=tasks_keyboard(sponsors, 1),
+            "📌 *Подпишись на каналы, затем нажми 'Проверить подписки':*",
+            reply_markup=sponsors_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
         return False
@@ -878,39 +868,43 @@ def main_menu(user_id: int = 0):
         builder.row(types.KeyboardButton(text="👑 Админ"))
     return builder.as_markup(resize_keyboard=True)
 
-def tasks_keyboard(tasks, page=1):
+def sponsors_keyboard(sponsors, page=1):
     builder = InlineKeyboardBuilder()
     
     per_page = 25
-    total_pages = (len(tasks) + per_page - 1) // per_page if tasks else 1
+    total_pages = (len(sponsors) + per_page - 1) // per_page if sponsors else 1
     start = (page - 1) * per_page
     end = start + per_page
-    page_tasks = tasks[start:end]
+    page_sponsors = sponsors[start:end]
     
-    for idx, task in enumerate(page_tasks, start + 1):
-        if not isinstance(task, dict):
+    for idx, sp in enumerate(page_sponsors, start + 1):
+        if not isinstance(sp, dict):
             continue
-        link = task.get("link") or task.get("target_link")
-        service = task.get("service") or task.get("service_name") or "Задание"
+        link = sp.get("link") or sp.get("target_link")
         if link and link.startswith("http"):
-            builder.row(
-                types.InlineKeyboardButton(text=f"📢 {service[:15]}", url=link),
-                types.InlineKeyboardButton(text="✅ Я выполнил", callback_data=f"task_done_{idx}")
-            )
+            builder.row(types.InlineKeyboardButton(
+                text=f"📢 Канал #{idx}",
+                url=link
+            ))
     
     nav_row = []
     if page > 1:
         nav_row.append(types.InlineKeyboardButton(
             text="⬅️ Назад",
-            callback_data=f"tasks_page_{page - 1}"
+            callback_data=f"sponsors_page_{page - 1}"
         ))
     if page < total_pages:
         nav_row.append(types.InlineKeyboardButton(
             text="➡️ Далее",
-            callback_data=f"tasks_page_{page + 1}"
+            callback_data=f"sponsors_page_{page + 1}"
         ))
     if nav_row:
         builder.row(*nav_row)
+    
+    builder.row(types.InlineKeyboardButton(
+        text="✅ Проверить подписки",
+        callback_data="check_subs"
+    ))
     
     return builder.as_markup()
 
@@ -971,8 +965,8 @@ async def start_cmd(message: types.Message):
     
     if sponsors:
         await message.answer(
-            "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
-            reply_markup=tasks_keyboard(sponsors, 1),
+            "📌 *Подпишись на каналы, затем нажми 'Проверить подписки':*",
+            reply_markup=sponsors_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
     else:
@@ -983,66 +977,8 @@ async def start_cmd(message: types.Message):
             parse_mode="Markdown"
         )
 
-@dp.callback_query(F.data.startswith("task_done_"))
-async def task_done(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    task_index = int(callback.data.split("_")[2])
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT payload FROM sponsor_cache WHERE cache_key = ?",
-            (f"all_sponsors_{user_id}",)
-        ) as c:
-            row = await c.fetchone()
-    
-    if not row:
-        await callback.answer("❌ Задания устарели, обнови страницу!")
-        return
-    
-    sponsors = json.loads(row[0])
-    
-    if task_index <= len(sponsors):
-        task = sponsors[task_index - 1]
-        link = task.get("link") or task.get("target_link")
-        service = task.get("service") or "unknown"
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND link = ? AND service = ?",
-                (user_id, link, service)
-            )
-            await db.commit()
-        
-        del sponsors[task_index - 1]
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO sponsor_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
-                (f"all_sponsors_{user_id}", json.dumps(sponsors), time.time() + 300)
-            )
-            await db.commit()
-        
-        if sponsors:
-            await callback.message.edit_text(
-                "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
-                reply_markup=tasks_keyboard(sponsors, 1),
-                parse_mode="Markdown"
-            )
-            await callback.answer("✅ Задание выполнено! Осталось ещё.")
-        else:
-            await activate_user(user_id, callback.from_user.username or "Unknown")
-            await callback.message.delete()
-            await callback.message.answer(
-                "🎉 *Все задания выполнены! Добро пожаловать!*",
-                reply_markup=main_menu(user_id),
-                parse_mode="Markdown"
-            )
-            await callback.answer("🎉 Ты выполнил все задания!")
-    else:
-        await callback.answer("❌ Ошибка! Попробуй снова.")
-
-@dp.callback_query(F.data.startswith("tasks_page_"))
-async def tasks_page(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("sponsors_page_"))
+async def sponsors_page(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     
@@ -1054,17 +990,265 @@ async def tasks_page(callback: types.CallbackQuery):
             row = await c.fetchone()
     
     if not row:
-        await callback.answer("❌ Задания устарели, обновите страницу!")
+        await callback.answer("❌ Спонсоры устарели, обновите страницу!")
         return
     
     sponsors = json.loads(row[0])
     try:
         await callback.message.edit_reply_markup(
-            reply_markup=tasks_keyboard(sponsors, page)
+            reply_markup=sponsors_keyboard(sponsors, page)
         )
     except Exception as e:
         await callback.answer("❌ Ошибка при переключении страницы!")
     await callback.answer()
+
+@dp.callback_query(F.data == "check_subs")
+async def check_subs(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.answer("🔄 Проверяю подписки...")
+    
+    logging.info(f"Начинаю проверку для {user_id}")
+    
+    # 1. Piarflow
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT link FROM sponsor_tasks WHERE user_id = ? AND service = 'piarflow' AND status != 'subscribed'", (user_id,)) as c:
+            piarflow_tasks = await c.fetchall()
+    
+    if piarflow_tasks:
+        links = [t[0] for t in piarflow_tasks]
+        results = await check_piarflow_sponsors(user_id, links)
+        logging.info(f"Piarflow результаты: {results}")
+        
+        for r in results:
+            if r.get("status") in ["subscribed", "not_counted"]:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'piarflow' AND link = ?",
+                        (user_id, r.get("link"))
+                    )
+                    await db.commit()
+    
+    # 2. Flyer
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT signature FROM sponsor_tasks WHERE user_id = ? AND service = 'flyer' AND status != 'subscribed'", (user_id,)) as c:
+            flyer_tasks = await c.fetchall()
+    
+    for row in flyer_tasks:
+        signature = row[0]
+        if signature:
+            done = await check_flyer_task(user_id, signature)
+            if done:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?",
+                        (user_id, signature)
+                    )
+                    await db.commit()
+    
+    # 3. TGrass
+    if await check_tgrass_subscription(user_id):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'",
+                (user_id,)
+            )
+            await db.commit()
+    
+    # 4. Traffy
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'traffy' AND status != 'subscribed'", (user_id,)) as c:
+            traffy_tasks = await c.fetchall()
+    
+    if traffy_tasks:
+        assignment_ids = [t[0] for t in traffy_tasks]
+        results = await check_traffy_tasks(user_id, assignment_ids)
+        for r in results:
+            if r.get("status") == "completed":
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'traffy' AND assignment_id = ?",
+                        (user_id, r.get("assignment_id"))
+                    )
+                    await db.commit()
+    
+    # 5. Botohub
+    if await check_botohub_tasks(user_id):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'",
+                (user_id,)
+            )
+            await db.commit()
+    
+    # 6. DarkBoost
+    darkboost_done = await check_darkboost_sponsors(user_id)
+    if darkboost_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'darkboost'",
+                (user_id,)
+            )
+            await db.commit()
+    
+    # 7. Trafsly
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT assignment_id, need_check FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
+            (user_id,)
+        ) as c:
+            trafsly_tasks = await c.fetchall()
+    
+    if trafsly_tasks:
+        for assignment_id, need_check in trafsly_tasks:
+            if need_check == 0:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
+                        (user_id, assignment_id)
+                    )
+                    await db.commit()
+            else:
+                try:
+                    await check_trafsly_sponsors(user_id, [int(assignment_id)])
+                except:
+                    pass
+    
+    # ФИНАЛЬНАЯ ПРОВЕРКА
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
+            count = await c.fetchone()
+            all_done = count[0] == 0
+    
+    if all_done:
+        await activate_user(user_id, callback.from_user.username or "Unknown")
+        await callback.message.delete()
+        await callback.message.answer(
+            "🎉 *Все подписки подтверждены! Добро пожаловать!*",
+            reply_markup=main_menu(user_id),
+            parse_mode="Markdown"
+        )
+        await callback.answer("✅ Все задания выполнены!")
+    else:
+        # Получаем список неподтверждённых спонсоров
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT link, service FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'",
+                (user_id,)
+            ) as c:
+                unsubscribed = await c.fetchall()
+        
+        if unsubscribed:
+            # Сохраняем заявку в БД
+            sponsors_list = [{"link": link, "service": service} for link, service in unsubscribed]
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO manual_checks (user_id, username, sponsors, created_at) VALUES (?, ?, ?, ?)",
+                    (user_id, callback.from_user.username or "Unknown", json.dumps(sponsors_list), time.time())
+                )
+                await db.commit()
+            
+            # Отправляем админу
+            kb = InlineKeyboardBuilder()
+            kb.row(
+                types.InlineKeyboardButton(text="✅ Разрешить доступ", callback_data=f"manual_allow_{user_id}"),
+                types.InlineKeyboardButton(text="❌ Отказать", callback_data=f"manual_deny_{user_id}")
+            )
+            
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔔 *Ручная проверка подписок!*\n\n"
+                f"👤 Пользователь: @{callback.from_user.username or 'нет'} (ID: {user_id})\n"
+                f"📊 Неподтверждённых спонсоров: {len(unsubscribed)}\n\n"
+                f"📌 Список:\n" + "\n".join([f"  • {link} ({service})" for link, service in unsubscribed]),
+                reply_markup=kb.as_markup(),
+                parse_mode="Markdown"
+            )
+            
+            await callback.answer(f"❌ Осталось {len(unsubscribed)} подписок! Отправлено админу.", show_alert=True)
+            
+            # Обновляем список спонсоров
+            user = types.User(id=user_id, is_bot=False, first_name="User", last_name=None, username=None, language_code="ru")
+            sponsors = await get_all_sponsors(user, force_refresh=True)
+            if sponsors:
+                await callback.message.edit_reply_markup(
+                    reply_markup=sponsors_keyboard(sponsors, 1)
+                )
+        else:
+            await callback.answer("❌ Ошибка проверки!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("manual_allow_"))
+async def manual_allow(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username FROM manual_checks WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+            (user_id,)
+        ) as c:
+            row = await c.fetchone()
+            username = row[0] if row else "Unknown"
+        
+        await db.execute(
+            "UPDATE manual_checks SET status = 'approved' WHERE user_id = ? AND status = 'pending'",
+            (user_id,)
+        )
+        await db.commit()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+        await db.commit()
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "🎉 *Доступ разрешён администратором!*\n\n"
+            "Добро пожаловать в бота!",
+            reply_markup=main_menu(user_id),
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.message.edit_text(
+        f"✅ *Доступ разрешён для пользователя {user_id}*",
+        parse_mode="Markdown"
+    )
+    await callback.answer("✅ Доступ разрешён!")
+
+@dp.callback_query(F.data.startswith("manual_deny_"))
+async def manual_deny(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE manual_checks SET status = 'denied' WHERE user_id = ? AND status = 'pending'",
+            (user_id,)
+        )
+        await db.commit()
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "❌ *Доступ отклонён администратором.*\n\n"
+            "Проверь подписки и попробуй снова.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    await callback.message.edit_text(
+        f"❌ *Доступ отклонён для пользователя {user_id}*",
+        parse_mode="Markdown"
+    )
+    await callback.answer("❌ Доступ отклонён!")
 
 @dp.message(F.text == "👤 Профиль")
 async def profile_cmd(message: types.Message):
