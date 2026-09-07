@@ -552,12 +552,21 @@ async def check_sponsors_before_action(message: types.Message):
         await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
         return True
 
-# ========== МЕНЮ ==========
+# ========== КРАСИВЫЕ КНОПКИ ==========
 def main_menu():
     builder = ReplyKeyboardBuilder()
-    builder.row(types.KeyboardButton(text="⭐ Заработать звёзды"), types.KeyboardButton(text="💰 Баланс"))
-    builder.row(types.KeyboardButton(text="👤 Профиль"), types.KeyboardButton(text="🎁 Ежедневный бонус"))
-    builder.row(types.KeyboardButton(text="💎 Вывести звёзды"), types.KeyboardButton(text="👑 Админ-панель"))
+    builder.row(
+        types.KeyboardButton(text="⭐ Заработать звёзды"),
+        types.KeyboardButton(text="💰 Баланс")
+    )
+    builder.row(
+        types.KeyboardButton(text="👤 Профиль"),
+        types.KeyboardButton(text="🎁 Бонус")
+    )
+    builder.row(
+        types.KeyboardButton(text="💎 Вывод"),
+        types.KeyboardButton(text="👑 Админ")
+    )
     return builder.as_markup(resize_keyboard=True)
 
 def sponsors_keyboard(sponsors):
@@ -565,8 +574,40 @@ def sponsors_keyboard(sponsors):
     for idx, sp in enumerate(sponsors[:MAX_SPONSORS], 1):
         link = sp.get("link") or sp.get("target_link")
         if link:
-            builder.row(types.InlineKeyboardButton(text=f"📢 Задание #{idx}", url=link))
-    builder.row(types.InlineKeyboardButton(text="✅ Проверить подписки", callback_data="check_subs"))
+            builder.row(types.InlineKeyboardButton(
+                text=f"📢 Подписаться #{idx}",
+                url=link
+            ))
+    builder.row(types.InlineKeyboardButton(
+        text="✅ Проверить",
+        callback_data="check_subs"
+    ))
+    return builder.as_markup()
+
+def admin_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"),
+        types.InlineKeyboardButton(text="📋 Статус", callback_data="admin_sponsor_status")
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="📋 Логи", callback_data="admin_logs"),
+        types.InlineKeyboardButton(text="⚙ Награда", callback_data="admin_set_reward")
+    )
+    builder.row(
+        types.InlineKeyboardButton(text="💰 Баланс", callback_data="admin_give_balance"),
+        types.InlineKeyboardButton(text="🧪 Тест", callback_data="admin_test_sponsors")
+    )
+    builder.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
+    return builder.as_markup()
+
+def withdraw_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="⭐ 15", callback_data="withdraw_15"),
+        types.InlineKeyboardButton(text="⭐ 25", callback_data="withdraw_25"),
+        types.InlineKeyboardButton(text="⭐ 50", callback_data="withdraw_50")
+    )
     return builder.as_markup()
 
 # ========== ХЕНДЛЕРЫ ==========
@@ -585,16 +626,27 @@ async def start_cmd(message: types.Message):
     sponsors = await get_all_sponsors(message.from_user)
     
     if sponsors:
-        await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
+        await message.answer(
+            "📌 *Выполни задания для доступа к боту:*",
+            reply_markup=sponsors_keyboard(sponsors),
+            parse_mode="Markdown"
+        )
     else:
         await activate_user(user_id)
-        await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
+        await message.answer(
+            "🎉 *Добро пожаловать!*",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
 
 @dp.callback_query(F.data == "check_subs")
 async def check_subs(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    await callback.answer("🔄 Проверяю подписки...")
+    await callback.answer("🔄 Проверяю...")
     
+    logging.info(f"Начинаю проверку для {user_id}")
+    
+    # 1. Piarflow
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT link FROM sponsor_tasks WHERE user_id = ? AND service = 'piarflow' AND status != 'subscribed'", (user_id,)) as c:
             piarflow_tasks = await c.fetchall()
@@ -602,8 +654,18 @@ async def check_subs(callback: types.CallbackQuery):
     if piarflow_tasks:
         links = [t[0] for t in piarflow_tasks]
         results = await check_piarflow_sponsors(user_id, links)
-        logging.info(f"Piarflow проверка: {results}")
+        logging.info(f"Piarflow результаты: {results}")
+        
+        for r in results:
+            if r.get("status") in ["subscribed", "not_counted"]:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'piarflow' AND link = ?",
+                        (user_id, r.get("link"))
+                    )
+                    await db.commit()
     
+    # 2. Flyer
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT signature FROM sponsor_tasks WHERE user_id = ? AND service = 'flyer' AND status != 'subscribed'", (user_id,)) as c:
             flyer_tasks = await c.fetchall()
@@ -614,34 +676,71 @@ async def check_subs(callback: types.CallbackQuery):
             done = await check_flyer_task(user_id, signature)
             if done:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?", (user_id, signature))
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'flyer' AND signature = ?",
+                        (user_id, signature)
+                    )
                     await db.commit()
     
-    tgrass_done = await check_tgrass_subscription(user_id)
-    if tgrass_done:
+    # 3. TGrass
+    if await check_tgrass_subscription(user_id):
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'", (user_id,))
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'tgrass'",
+                (user_id,)
+            )
             await db.commit()
     
+    # 4. Traffy
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'traffy' AND status != 'subscribed'", (user_id,)) as c:
             traffy_tasks = await c.fetchall()
     
     if traffy_tasks:
         assignment_ids = [t[0] for t in traffy_tasks]
-        await check_traffy_tasks(user_id, assignment_ids)
+        results = await check_traffy_tasks(user_id, assignment_ids)
+        for r in results:
+            if r.get("status") == "completed":
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'traffy' AND assignment_id = ?",
+                        (user_id, r.get("assignment_id"))
+                    )
+                    await db.commit()
     
-    botohub_done = await check_botohub_tasks(user_id)
-    if botohub_done:
+    # 5. Botohub
+    if await check_botohub_tasks(user_id):
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'", (user_id,))
+            await db.execute(
+                "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'botohub'",
+                (user_id,)
+            )
             await db.commit()
     
-    if await activate_user(user_id):
+    # ФИНАЛЬНАЯ ПРОВЕРКА
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
+            count = await c.fetchone()
+            all_done = count[0] == 0
+    
+    if all_done:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+        
         await callback.message.delete()
-        await callback.message.answer("🎉 Все задания выполнены!", reply_markup=main_menu())
+        await callback.message.answer(
+            "🎉 *Все задания выполнены! Добро пожаловать!*",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
     else:
-        await callback.answer("❌ Ты выполнил не все задания!", show_alert=True)
+        await callback.answer("❌ Выполни не все задания!", show_alert=True)
+        
+        user = types.User(id=user_id, is_bot=False, first_name="User", last_name=None, username=None, language_code="ru")
+        sponsors = await get_all_sponsors(user, force_refresh=True)
+        if sponsors:
+            await callback.message.edit_reply_markup(reply_markup=sponsors_keyboard(sponsors))
 
 @dp.message(F.text == "💰 Баланс")
 async def balance_cmd(message: types.Message):
@@ -649,7 +748,7 @@ async def balance_cmd(message: types.Message):
         return
     user = await get_user(message.from_user.id)
     if user:
-        await message.answer(f"💳 Твой баланс: {user['balance']:.1f} ⭐")
+        await message.answer(f"💳 *Твой баланс:* {user['balance']:.1f} ⭐", parse_mode="Markdown")
 
 @dp.message(F.text == "👤 Профиль")
 async def profile_cmd(message: types.Message):
@@ -658,7 +757,11 @@ async def profile_cmd(message: types.Message):
     user = await get_user(message.from_user.id)
     if user:
         await message.answer(
-            f"👤 *Твой профиль*\n\n🆔 ID: `{user['user_id']}`\n💰 Баланс: {user['balance']:.1f} ⭐\n👥 Рефералов: {user['referrals_count']}\n📊 Всего заработано: {user['total_earned']:.1f} ⭐",
+            f"👤 *Твой профиль*\n\n"
+            f"🆔 ID: `{user['user_id']}`\n"
+            f"💰 Баланс: {user['balance']:.1f} ⭐\n"
+            f"👥 Рефералов: {user['referrals_count']}\n"
+            f"📊 Всего заработано: {user['total_earned']:.1f} ⭐",
             parse_mode="Markdown"
         )
 
@@ -674,12 +777,13 @@ async def earn_stars(message: types.Message):
     bot_info = await bot.get_me()
     reward = await get_ref_reward()
     await message.answer(
-        f"🔗 Твоя реферальная ссылка:\nhttps://t.me/{bot_info.username}?start={user_id}\n\n"
-        f"Приглашай друзей и получай {reward} ⭐ за каждого!",
+        f"🔗 *Твоя реферальная ссылка:*\n"
+        f"https://t.me/{bot_info.username}?start={user_id}\n\n"
+        f"Приглашай друзей и получай *{reward} ⭐* за каждого!",
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "🎁 Ежедневный бонус")
+@dp.message(F.text == "🎁 Бонус")
 async def daily_bonus(message: types.Message):
     if not await check_sponsors_before_action(message):
         return
@@ -696,9 +800,9 @@ async def daily_bonus(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET last_bonus = ? WHERE user_id = ?", (today, user_id))
         await db.commit()
-    await message.answer("🎁 Ты получил 0.5 ⭐! Приходи завтра снова.")
+    await message.answer("🎁 *Ты получил 0.5 ⭐!* Приходи завтра снова.", parse_mode="Markdown")
 
-@dp.message(F.text == "💎 Вывести звёзды")
+@dp.message(F.text == "💎 Вывод")
 async def withdraw_start(message: types.Message):
     if not await check_sponsors_before_action(message):
         return
@@ -709,13 +813,9 @@ async def withdraw_start(message: types.Message):
     if user["balance"] < 15:
         await message.answer(f"❌ Минимальная сумма вывода — 15 ⭐. Твой баланс: {user['balance']:.1f} ⭐")
         return
-    kb = InlineKeyboardBuilder()
-    kb.row(types.InlineKeyboardButton(text="⭐ 15 Звёзд", callback_data="withdraw_15"))
-    kb.row(types.InlineKeyboardButton(text="⭐ 25 Звёзд", callback_data="withdraw_25"))
-    kb.row(types.InlineKeyboardButton(text="⭐ 50 Звёзд", callback_data="withdraw_50"))
     await message.answer(
         f"💎 *Вывод звёзд*\n\nТвой баланс: {user['balance']:.1f} ⭐\nВыбери сумму:",
-        reply_markup=kb.as_markup(),
+        reply_markup=withdraw_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -730,12 +830,14 @@ async def process_withdraw(callback: types.CallbackQuery):
     await update_balance(user_id, -amount)
     try:
         await callback.message.edit_text(
-            f"✅ Заявка на вывод {amount} ⭐ принята!\nАдминистратор отправит тебе подарок в течение 24 часов.",
+            f"✅ *Заявка на вывод {amount} ⭐ принята!*\n"
+            f"Администратор отправит тебе подарок в течение 24 часов.",
             parse_mode="Markdown"
         )
     except Exception as e:
         await callback.message.answer(
-            f"✅ Заявка на вывод {amount} ⭐ принята!\nАдминистратор отправит тебе подарок в течение 24 часов.",
+            f"✅ *Заявка на вывод {amount} ⭐ принята!*\n"
+            f"Администратор отправит тебе подарок в течение 24 часов.",
             parse_mode="Markdown"
         )
     if ADMIN_ID:
@@ -744,7 +846,7 @@ async def process_withdraw(callback: types.CallbackQuery):
         except:
             pass
 
-@dp.message(F.text == "👑 Админ-панель")
+@dp.message(F.text == "👑 Админ")
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
     if not await check_sponsors_before_action(message):
@@ -752,15 +854,11 @@ async def admin_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ У тебя нет доступа!")
         return
-    kb = InlineKeyboardBuilder()
-    kb.row(types.InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
-    kb.row(types.InlineKeyboardButton(text="📋 Статус спонсоров", callback_data="admin_sponsor_status"))
-    kb.row(types.InlineKeyboardButton(text="📋 Логи спонсоров", callback_data="admin_logs"))
-    kb.row(types.InlineKeyboardButton(text="⚙ Награда за реферала", callback_data="admin_set_reward"))
-    kb.row(types.InlineKeyboardButton(text="💰 Выдать/забрать баланс", callback_data="admin_give_balance"))
-    kb.row(types.InlineKeyboardButton(text="🧪 Тест спонсоров", callback_data="admin_test_sponsors"))
-    kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
-    await message.answer("👑 *Админ-панель*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await message.answer(
+        "👑 *Админ-панель*",
+        reply_markup=admin_keyboard(),
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
@@ -780,7 +878,8 @@ async def admin_stats(callback: types.CallbackQuery):
         f"👥 Пользователей: {total}\n"
         f"💰 Всего звёзд: {total_balance:.1f}\n"
         f"⚙ Награда за реферала: {ref_reward} ⭐",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=admin_keyboard()
     )
 
 @dp.callback_query(F.data == "admin_sponsor_status")
@@ -794,7 +893,7 @@ async def admin_sponsor_status(callback: types.CallbackQuery):
         ) as c:
             rows = await c.fetchall()
     if not rows:
-        await callback.message.edit_text("📋 *Статус спонсоров:*\n\nНет данных.", parse_mode="Markdown")
+        await callback.message.edit_text("📋 *Статус спонсоров:*\n\nНет данных.", parse_mode="Markdown", reply_markup=admin_keyboard())
         return
     text = "📋 *Статус спонсоров (последние 20):*\n\n"
     for user_id, status, reason, updated_at in rows:
@@ -803,7 +902,7 @@ async def admin_sponsor_status(callback: types.CallbackQuery):
         text += f"{emoji} [{date}] ID {user_id} → *{status}*\n"
         if reason:
             text += f"   📌 {reason}\n"
-    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
 @dp.callback_query(F.data == "admin_logs")
 async def admin_logs(callback: types.CallbackQuery):
@@ -814,13 +913,13 @@ async def admin_logs(callback: types.CallbackQuery):
         async with db.execute("SELECT user_id, service, link, created_at FROM sponsor_log ORDER BY created_at DESC LIMIT 20") as c:
             logs = await c.fetchall()
     if not logs:
-        await callback.message.edit_text("📋 *Логи спонсоров:*\n\nНет записей.", parse_mode="Markdown")
+        await callback.message.edit_text("📋 *Логи спонсоров:*\n\nНет записей.", parse_mode="Markdown", reply_markup=admin_keyboard())
         return
     text = "📋 *Последние выдачи:*\n\n"
     for user_id, service, link, created_at in logs:
         date = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
         text += f"• [{date}] {service} → user {user_id}\n"
-    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
 @dp.callback_query(F.data == "admin_set_reward")
 async def admin_set_reward_start(callback: types.CallbackQuery, state: FSMContext):
@@ -915,7 +1014,7 @@ async def admin_test_sponsors(callback: types.CallbackQuery):
     results.append(f"*Botohub:* {botohub}")
     
     text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
-    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
 @dp.callback_query(F.data == "admin_close")
 async def admin_close(callback: types.CallbackQuery):
