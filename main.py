@@ -7,7 +7,7 @@ import random
 import aiosqlite
 import aiohttp
 from aiohttp import web
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -110,7 +110,24 @@ async def init_db():
             status TEXT DEFAULT 'pending',
             created_at REAL
         )""")
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS daily_earnings (
+            user_id INTEGER,
+            date TEXT,
+            earned REAL DEFAULT 0.0,
+            PRIMARY KEY (user_id, date)
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS daily_top (
+            date TEXT PRIMARY KEY,
+            winner1_id INTEGER,
+            winner2_id INTEGER,
+            winner3_id INTEGER,
+            reward1 REAL,
+            reward2 REAL,
+            reward3 REAL,
+            total_earned REAL
+        )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_sponsors', '20')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sponsor_reward', '0.4')")
         await db.commit()
@@ -121,12 +138,6 @@ async def get_user(user_id: int):
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as c:
             row = await c.fetchone()
             return dict(row) if row else None
-
-async def get_ref_reward():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as c:
-            row = await c.fetchone()
-            return float(row[0]) if row else 3.0
 
 async def get_max_sponsors():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -152,21 +163,12 @@ async def register_user(user_id: int, username: str, referrer_id: int = None):
         )
         
         if referrer_id and referrer_id != user_id:
-            # Считаем количество спонсоров (пока ещё не подписанных)
-            async with db.execute(
-                "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status = 'subscribed'",
-                (user_id,)
-            ) as c:
-                count = await c.fetchone()
-                sponsors_count = count[0] if count else 0
-            
-            # Отправляем уведомление о новом реферале
             try:
                 await bot.send_message(
                     referrer_id,
-                    f"🔔 *НОВЫЙ РЕФЕРАЛ!*\n\n"
+                    f"🔔 *НОВЫЙ РЕФЕРАЛ!*\n"
                     f"🛫 Реферал: {username or 'Без юзернейма'} (@{username or 'нет'})\n"
-                    f"🗂 Ему выдано спонсоров: {sponsors_count}\n\n"
+                    f"🗂 Ему выдано спонсоров: 0\n"
                     f"🖥 *После подписки на спонсоров вы получите награду!*\n"
                     f"📊 Награда зависит от количества спонсоров!",
                     parse_mode="Markdown"
@@ -184,6 +186,15 @@ async def update_balance(user_id: int, amount: float):
                 total_earned = total_earned + CASE WHEN ? > 0 THEN ? ELSE 0 END 
             WHERE user_id = ?
         """, (amount, amount, amount, user_id))
+        
+        if amount > 0:
+            today = datetime.now().date().isoformat()
+            await db.execute("""
+                INSERT INTO daily_earnings (user_id, date, earned) 
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, date) DO UPDATE SET earned = earned + ?
+            """, (user_id, today, amount, amount))
+        
         await db.commit()
 
 async def log_sponsor(user_id: int, service: str, link: str, status: str):
@@ -764,6 +775,29 @@ async def check_all_subscriptions(user_id: int):
                 if count and count[0] > 0:
                     all_done = False
     
+    # Trafsly (задания без проверки)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT assignment_id, need_check FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
+            (user_id,)
+        ) as c:
+            trafsly_tasks = await c.fetchall()
+    
+    if trafsly_tasks:
+        for assignment_id, need_check in trafsly_tasks:
+            if need_check == 0:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
+                        (user_id, assignment_id)
+                    )
+                    await db.commit()
+            else:
+                try:
+                    await check_trafsly_sponsors(user_id, [int(assignment_id)])
+                except:
+                    pass
+    
     if not all_done:
         await log_sponsor_status(user_id, "not_subscribed", "Пользователь не подписался на все каналы")
     else:
@@ -780,16 +814,13 @@ async def activate_user(user_id: int, username: str = "Unknown"):
         return False
     
     async with aiosqlite.connect(DB_PATH) as db:
-        # Получаем referrer_id ДО активации
         async with db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)) as c:
             row = await c.fetchone()
             referrer_id = row[0] if row else None
         
-        # Активируем пользователя
         await db.execute("UPDATE users SET is_activated = 1 WHERE user_id = ?", (user_id,))
         
         if referrer_id and referrer_id != user_id:
-            # Считаем количество подписанных спонсоров
             async with db.execute(
                 "SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status = 'subscribed'",
                 (user_id,)
@@ -797,7 +828,6 @@ async def activate_user(user_id: int, username: str = "Unknown"):
                 count = await c.fetchone()
                 sponsors_count = count[0] if count else 0
             
-            # Рассчитываем награду за спонсоров
             sponsor_reward = await get_sponsor_reward()
             reward = sponsors_count * sponsor_reward
             
@@ -809,55 +839,93 @@ async def activate_user(user_id: int, username: str = "Unknown"):
                         referrals_count = referrals_count + 1 
                     WHERE user_id = ?
                 """, (reward, reward, referrer_id))
-            
-            # ===== БОНУС ЗА КАЖДЫЕ 5 АКТИВНЫХ РЕФЕРАЛОВ =====
-            async with db.execute(
-                "SELECT COUNT(*) FROM users WHERE referrer_id = ? AND is_activated = 1",
-                (referrer_id,)
-            ) as c:
-                active_refs = (await c.fetchone())[0]
-            
-            if active_refs % 5 == 0 and active_refs > 0:
-                bonus = 15
+                
+                async with db.execute("SELECT balance FROM users WHERE user_id = ?", (referrer_id,)) as c:
+                    new_balance = (await c.fetchone())[0]
+                
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🆗 *Реферал подтвердил подписку!*\n"
+                        f"👤 Реферал: @{username or 'нет'}\n"
+                        f"💬 Награда: +{reward:.1f}⭐ ({sponsors_count} × {sponsor_reward})\n"
+                        f"📊 Спонсоров у реферала: {sponsors_count}\n"
+                        f"💎 *Твой баланс: {new_balance:.1f}⭐*",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+        
+        await db.commit()
+        return True
+
+# ========== ЕЖЕДНЕВНЫЙ ТОП РЕФЕРАЛОВ ==========
+async def calculate_daily_top():
+    today = datetime.now().date().isoformat()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT referrer_id, COUNT(*) as refs
+            FROM users
+            WHERE is_activated = 1 AND referrer_id IS NOT NULL
+            GROUP BY referrer_id
+            ORDER BY refs DESC
+            LIMIT 3
+        """) as c:
+            top = await c.fetchall()
+        
+        async with db.execute(
+            "SELECT SUM(earned) FROM daily_earnings WHERE date = ?",
+            (today,)
+        ) as c:
+            total_earned = (await c.fetchone())[0] or 0.0
+        
+        if total_earned == 0 or not top:
+            return
+        
+        reward_percentages = [0.15, 0.10, 0.05]
+        winners = []
+        
+        for idx, (referrer_id, refs) in enumerate(top):
+            if idx < 3:
+                reward = total_earned * reward_percentages[idx]
+                winners.append((referrer_id, reward))
+                
                 await db.execute("""
                     UPDATE users 
                     SET balance = balance + ?, 
                         total_earned = total_earned + ? 
                     WHERE user_id = ?
-                """, (bonus, bonus, referrer_id))
-                
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎉 *БОНУС ЗА РЕФЕРАЛОВ!*\n\n"
-                        f"Ты привёл *{active_refs} активных рефералов*!\n"
-                        f"💰 Получи бонус: *+{bonus} ⭐*\n\n"
-                        f"Следующий бонус будет на *{active_refs + 5}* рефералов!",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
-            
-            # Получаем новый баланс реферера (после всех начислений)
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (referrer_id,)) as c:
-                new_balance = (await c.fetchone())[0]
-            
-            # ===== УВЕДОМЛЕНИЕ О ПОДТВЕРЖДЕНИИ =====
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    f"🆗 *Реферал подтвердил подписку!*\n\n"
-                    f"👤 Реферал: @{username or 'нет'}\n"
-                    f"💬 Награда: +{reward:.1f}⭐ ({sponsors_count} × {sponsor_reward})\n"
-                    f"📊 Спонсоров у реферала: {sponsors_count}\n"
-                    f"💎 *Твой баланс: {new_balance:.1f}⭐*",
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logging.error(f"Ошибка отправки уведомления рефереру {referrer_id}: {e}")
+                """, (reward, reward, referrer_id))
+        
+        await db.execute("""
+            INSERT OR REPLACE INTO daily_top (date, winner1_id, winner2_id, winner3_id, reward1, reward2, reward3, total_earned)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (today, 
+              winners[0][0] if len(winners) > 0 else None, 
+              winners[1][0] if len(winners) > 1 else None, 
+              winners[2][0] if len(winners) > 2 else None,
+              winners[0][1] if len(winners) > 0 else 0,
+              winners[1][1] if len(winners) > 1 else 0,
+              winners[2][1] if len(winners) > 2 else 0,
+              total_earned))
         
         await db.commit()
-        return True
+    
+    for idx, (referrer_id, reward) in enumerate(winners):
+        place = ["🥇", "🥈", "🥉"][idx]
+        try:
+            user = await get_user(referrer_id)
+            await bot.send_message(
+                referrer_id,
+                f"🏆 *ЕЖЕДНЕВНЫЙ ТОП РЕФЕРАЛОВ!*\n\n"
+                f"{place} Ты занял *{idx+1} место*!\n"
+                f"💰 Твоя награда: *+{reward:.1f} ⭐*\n"
+                f"📊 Общий заработок всех пользователей за день: {total_earned:.1f} ⭐",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
 
 # ========== ПРОВЕРКА СПОНСОРОВ ПЕРЕД КНОПКОЙ ==========
 async def check_sponsors_before_action(message: types.Message):
@@ -875,7 +943,7 @@ async def check_sponsors_before_action(message: types.Message):
     
     if sponsors:
         await message.answer(
-            "📌 *Выполни задания для доступа к боту:*",
+            "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
             reply_markup=tasks_keyboard(sponsors, 1),
             parse_mode="Markdown"
         )
@@ -884,30 +952,30 @@ async def check_sponsors_before_action(message: types.Message):
         await activate_user(user_id, message.from_user.username or "Unknown")
         await message.answer(
             "🎉 *Добро пожаловать!*",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(message.from_user.id),
             parse_mode="Markdown"
         )
         return True
 
 # ========== КЛАВИАТУРЫ ==========
-def main_menu():
+def main_menu(user_id: int = 0):
     builder = ReplyKeyboardBuilder()
     builder.row(
         types.KeyboardButton(text="⭐ Заработать звёзды"),
         types.KeyboardButton(text="👤 Профиль")
     )
     builder.row(
-        types.KeyboardButton(text="🎁 Бонус"),
+        types.KeyboardButton(text="🏆 Топ рефералов"),
         types.KeyboardButton(text="💎 Вывод")
     )
-    builder.row(types.KeyboardButton(text="👑 Админ"))
+    if user_id == ADMIN_ID and ADMIN_ID != 0:
+        builder.row(types.KeyboardButton(text="👑 Админ"))
     return builder.as_markup(resize_keyboard=True)
 
 def tasks_keyboard(tasks, page=1):
-    """Клавиатура с кнопками 'Я выполнил' для каждого задания"""
     builder = InlineKeyboardBuilder()
     
-    per_page = 15
+    per_page = 25
     total_pages = (len(tasks) + per_page - 1) // per_page if tasks else 1
     start = (page - 1) * per_page
     end = start + per_page
@@ -981,6 +1049,20 @@ async def start_cmd(message: types.Message):
     
     sponsors = await get_all_sponsors(message.from_user)
     
+    if referrer_id and referrer_id != user_id and sponsors:
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🔔 *НОВЫЙ РЕФЕРАЛ!*\n"
+                f"🛫 Реферал: {username or 'Без юзернейма'} (@{username or 'нет'})\n"
+                f"🗂 Ему выдано спонсоров: {len(sponsors)}\n"
+                f"🖥 *После подписки на спонсоров вы получите награду!*\n"
+                f"📊 Награда зависит от количества спонсоров!",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+    
     if sponsors:
         await message.answer(
             "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
@@ -991,7 +1073,7 @@ async def start_cmd(message: types.Message):
         await activate_user(user_id, username)
         await message.answer(
             "🎉 *Добро пожаловать!*",
-            reply_markup=main_menu(),
+            reply_markup=main_menu(user_id),
             parse_mode="Markdown"
         )
 
@@ -1000,7 +1082,6 @@ async def task_done(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     task_index = int(callback.data.split("_")[2])
     
-    # Получаем список текущих заданий из кэша
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT payload FROM sponsor_cache WHERE cache_key = ?",
@@ -1014,13 +1095,11 @@ async def task_done(callback: types.CallbackQuery):
     
     sponsors = json.loads(row[0])
     
-    # Помечаем задание как выполненное
     if task_index <= len(sponsors):
         task = sponsors[task_index - 1]
         link = task.get("link") or task.get("target_link")
         service = task.get("service") or "unknown"
         
-        # Сохраняем в БД как выполненное
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND link = ? AND service = ?",
@@ -1028,10 +1107,8 @@ async def task_done(callback: types.CallbackQuery):
             )
             await db.commit()
         
-        # Убираем выполненное задание из списка
         del sponsors[task_index - 1]
         
-        # Обновляем кэш
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO sponsor_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
@@ -1039,7 +1116,6 @@ async def task_done(callback: types.CallbackQuery):
             )
             await db.commit()
         
-        # Проверяем, остались ли задания
         if sponsors:
             await callback.message.edit_text(
                 "📌 *Выполни задания (нажми 'Я выполнил' после каждого):*",
@@ -1048,12 +1124,11 @@ async def task_done(callback: types.CallbackQuery):
             )
             await callback.answer("✅ Задание выполнено! Осталось ещё.")
         else:
-            # Все задания выполнены → активируем пользователя
             await activate_user(user_id, callback.from_user.username or "Unknown")
             await callback.message.delete()
             await callback.message.answer(
                 "🎉 *Все задания выполнены! Добро пожаловать!*",
-                reply_markup=main_menu(),
+                reply_markup=main_menu(user_id),
                 parse_mode="Markdown"
             )
             await callback.answer("🎉 Ты выполнил все задания!")
@@ -1092,7 +1167,6 @@ async def profile_cmd(message: types.Message):
     user_id = message.from_user.id
     user = await get_user(user_id)
     if user:
-        # Получаем количество активных рефералов (которые подтвердили подписку)
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM users WHERE referrer_id = ? AND is_activated = 1",
@@ -1100,7 +1174,6 @@ async def profile_cmd(message: types.Message):
             ) as c:
                 active_refs = (await c.fetchone())[0]
             
-            # Всего рефералов (все, кто перешёл по ссылке)
             async with db.execute(
                 "SELECT COUNT(*) FROM users WHERE referrer_id = ?",
                 (user_id,)
@@ -1127,32 +1200,62 @@ async def earn_stars(message: types.Message):
         await message.answer("❌ Сначала выполни задания через /start!")
         return
     bot_info = await bot.get_me()
-    reward = await get_ref_reward()
+    sponsor_reward = await get_sponsor_reward()
     await message.answer(
         f"🔗 *Твоя реферальная ссылка:*\n"
         f"https://t.me/{bot_info.username}?start={user_id}\n\n"
-        f"Приглашай друзей и получай *{reward} ⭐* за каждого!",
+        f"Приглашай друзей и получай *{sponsor_reward} ⭐* за каждого спонсора!\n"
+        f"📊 Чем больше спонсоров — тем больше награда!",
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "🎁 Бонус")
-async def daily_bonus(message: types.Message):
+@dp.message(F.text == "🏆 Топ рефералов")
+async def top_referrals(message: types.Message):
     if not await check_sponsors_before_action(message):
         return
-    user_id = message.from_user.id
+    
     today = datetime.now().date().isoformat()
-    user = await get_user(user_id)
-    if not user:
-        await message.answer("❌ Ты не зарегистрирован!")
-        return
-    if user.get("last_bonus") == today:
-        await message.answer("❌ Ты уже забирал бонус сегодня! Приходи завтра.")
-        return
-    await update_balance(user_id, 0.5)
+    
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET last_bonus = ? WHERE user_id = ?", (today, user_id))
-        await db.commit()
-    await message.answer("🎁 *Ты получил 0.5 ⭐!* Приходи завтра снова.", parse_mode="Markdown")
+        async with db.execute("SELECT * FROM daily_top WHERE date = ?", (today,)) as c:
+            top = await c.fetchone()
+        
+        if top:
+            winner1_id, winner2_id, winner3_id, reward1, reward2, reward3, total_earned = top[1], top[2], top[3], top[4], top[5], top[6], top[7]
+            
+            text = f"🏆 *Итоги дня ({today})*\n\n"
+            text += f"📊 Общий заработок: {total_earned:.1f} ⭐\n\n"
+            
+            if winner1_id:
+                user1 = await get_user(winner1_id)
+                text += f"🥇 {user1['username'] or 'ID'+str(winner1_id)} → *+{reward1:.1f}⭐* (15%)\n"
+            if winner2_id:
+                user2 = await get_user(winner2_id)
+                text += f"🥈 {user2['username'] or 'ID'+str(winner2_id)} → *+{reward2:.1f}⭐* (10%)\n"
+            if winner3_id:
+                user3 = await get_user(winner3_id)
+                text += f"🥉 {user3['username'] or 'ID'+str(winner3_id)} → *+{reward3:.1f}⭐* (5%)\n"
+            
+            my_place = None
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = ? AND is_activated = 1",
+                (message.from_user.id,)
+            ) as c:
+                my_refs = (await c.fetchone())[0]
+            
+            if my_refs > 0:
+                async with db.execute("""
+                    SELECT COUNT(*) + 1 FROM users u
+                    WHERE (SELECT COUNT(*) FROM users WHERE referrer_id = u.user_id AND is_activated = 1) > ?
+                """, (my_refs,)) as c:
+                    my_place = (await c.fetchone())[0]
+            
+            if my_place:
+                text += f"\n📍 *Твоё место:* #{my_place} (👥 {my_refs} реф.)"
+        else:
+            text = "⏳ *Итоги дня ещё не подведены.*\n\nПриводи больше рефералов и участвуй в завтрашнем топе!"
+    
+    await message.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "💎 Вывод")
 async def withdraw_start(message: types.Message, state: FSMContext):
@@ -1427,12 +1530,25 @@ async def admin_set_max_sponsors_process(message: types.Message, state: FSMConte
 async def admin_close(callback: types.CallbackQuery):
     await callback.message.delete()
 
+# ========== ФОНОВЫЕ ЗАДАЧИ ==========
+async def scheduled_tasks():
+    while True:
+        now = datetime.now()
+        next_run = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        wait_seconds = (next_run - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        await calculate_daily_top()
+
 # ========== ВЕБ-СЕРВЕР ==========
 async def handle(request):
     return web.Response(text="Bot is running!")
 
 async def main():
     await init_db()
+    
+    # Запускаем фоновую задачу для ежедневного топа
+    asyncio.create_task(scheduled_tasks())
+    
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -1440,6 +1556,7 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
