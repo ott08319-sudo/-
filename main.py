@@ -442,7 +442,7 @@ async def check_all_subscriptions(user_id: int):
     if piarflow_links:
         results = await check_piarflow_sponsors(user_id, piarflow_links)
         for r in results:
-            if r.get("status") != "subscribed":
+            if r.get("status") not in ["subscribed", "not_counted"]:  # ← ФИКС
                 all_done = False
     
     if traffy_ids:
@@ -754,10 +754,16 @@ async def process_withdraw(callback: types.CallbackQuery):
         await callback.answer(f"❌ Недостаточно средств!", show_alert=True)
         return
     await update_balance(user_id, -amount)
-    await callback.message.edit_text(
-        f"✅ Заявка на вывод {amount} ⭐ принята!\nАдминистратор отправит тебе подарок в течение 24 часов.",
-        parse_mode="Markdown"
-    )
+    try:
+        await callback.message.edit_text(
+            f"✅ Заявка на вывод {amount} ⭐ принята!\nАдминистратор отправит тебе подарок в течение 24 часов.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await callback.message.answer(
+            f"✅ Заявка на вывод {amount} ⭐ принята!\nАдминистратор отправит тебе подарок в течение 24 часов.",
+            parse_mode="Markdown"
+        )
     if ADMIN_ID:
         try:
             await bot.send_message(ADMIN_ID, f"🔔 Новая заявка на вывод!\nПользователь: ID {user_id}\nСумма: {amount} ⭐")
