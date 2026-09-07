@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import logging
@@ -861,14 +862,24 @@ async def check_subs(callback: types.CallbackQuery):
             )
             await db.commit()
     
-    # 6. Trafsly
+    # 6. Trafsly — только числовые ID
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'", (user_id,)) as c:
+        async with db.execute(
+            "SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'",
+            (user_id,)
+        ) as c:
             trafsly_tasks = await c.fetchall()
     
     if trafsly_tasks:
-        assignment_ids = [int(t[0]) for t in trafsly_tasks]
-        await check_trafsly_sponsors(user_id, assignment_ids)
+        assignment_ids = []
+        for row in trafsly_tasks:
+            try:
+                assignment_ids.append(int(row[0]))
+            except ValueError:
+                logging.warning(f"Пропускаем нечисловой ID для Trafsly: {row[0]}")
+                continue
+        if assignment_ids:
+            await check_trafsly_sponsors(user_id, assignment_ids)
     
     # ФИНАЛЬНАЯ ПРОВЕРКА
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1010,7 +1021,6 @@ async def photo_bot_menu(message: types.Message):
 
 @dp.callback_query(F.data == "photo_sell")
 async def photo_sell_start(callback: types.CallbackQuery, state: FSMContext):
-    # Доступно ВСЕМ пользователям
     await state.set_state(PhotoState.waiting_for_photo)
     await callback.message.edit_text(
         "📤 *Выставить фото*\n\n"
@@ -1124,7 +1134,6 @@ async def photo_view(callback: types.CallbackQuery):
         ))
     kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_gallery"))
     
-    # Отправляем фото с пометкой, что оно замазано
     await bot.send_photo(
         callback.from_user.id,
         file_id,
@@ -1174,7 +1183,6 @@ async def photo_buy(callback: types.CallbackQuery):
     
     await callback.answer("✅ Покупка успешна!", show_alert=True)
     
-    # Отправляем оригинал фото покупателю
     await bot.send_photo(
         buyer_id,
         file_id,
@@ -1185,7 +1193,6 @@ async def photo_buy(callback: types.CallbackQuery):
         parse_mode="Markdown"
     )
     
-    # Уведомляем продавца
     try:
         await bot.send_message(
             seller_id,
