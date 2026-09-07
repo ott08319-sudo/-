@@ -37,6 +37,12 @@ dp = Dispatcher()
 class AdminState(StatesGroup):
     waiting_for_reward = State()
     waiting_for_balance = State()
+    waiting_for_user_id = State()
+
+class PhotoState(StatesGroup):
+    waiting_for_photo = State()
+    waiting_for_price = State()
+    waiting_for_description = State()
 
 # ========== БАЗА ДАННЫХ ==========
 async def init_db():
@@ -85,6 +91,16 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            file_id TEXT,
+            price REAL,
+            description TEXT,
+            status TEXT DEFAULT 'active',
+            created_at REAL
         )""")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ref_reward', '3.0')")
         await db.commit()
@@ -324,7 +340,7 @@ async def check_botohub_tasks(user_id: int):
         logging.error(f"Botohub check error: {e}")
     return False
 
-# ========== ТЕСТ СПОНСОРОВ ==========
+# ========== ТЕСТЫ СПОНСОРОВ ==========
 async def test_piarflow(user_id: int):
     if not PIARFLOW_API_KEY:
         return "❌ Ключ не установлен"
@@ -380,7 +396,7 @@ async def test_botohub(user_id: int):
     except Exception as e:
         return f"❌ Ошибка: {str(e)}"
 
-# ========== ОСНОВНАЯ ЛОГИКА (БЕЗ КЭША) ==========
+# ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
     username = user.username or ""
@@ -392,7 +408,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     
     logging.info(f"Запрос спонсоров для {user_id}")
     
-    # Piarflow
     piarflow = await get_piarflow_sponsors(user_id, user_id, MAX_SPONSORS)
     for s in piarflow:
         await log_sponsor(user_id, "piarflow", s.get("link"), "выдан")
@@ -402,7 +417,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(piarflow)
     
-    # Flyer
     flyer = await get_flyer_tasks(user_id, lang)
     for s in flyer:
         await log_sponsor(user_id, "flyer", s.get("link"), "выдан")
@@ -412,7 +426,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(flyer)
     
-    # TGrass
     tgrass = await get_tgrass_offers(user_id, username, lang, is_premium)
     for s in tgrass:
         await log_sponsor(user_id, "tgrass", s.get("link"), "выдан")
@@ -422,7 +435,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(tgrass)
     
-    # Traffy
     traffy = await get_traffy_tasks(user_id, MAX_SPONSORS, first_name, username, lang)
     for s in traffy:
         await log_sponsor(user_id, "traffy", s.get("target_link"), "выдан")
@@ -432,7 +444,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(traffy)
     
-    # Botohub
     botohub = await get_botohub_tasks(user_id)
     for s in botohub:
         await log_sponsor(user_id, "botohub", s, "выдан")
@@ -557,14 +568,14 @@ def main_menu():
     builder = ReplyKeyboardBuilder()
     builder.row(
         types.KeyboardButton(text="⭐ Заработать звёзды"),
-        types.KeyboardButton(text="💰 Баланс")
+        types.KeyboardButton(text="👤 Профиль")
     )
     builder.row(
-        types.KeyboardButton(text="👤 Профиль"),
-        types.KeyboardButton(text="🎁 Бонус")
+        types.KeyboardButton(text="🎁 Бонус"),
+        types.KeyboardButton(text="💎 Вывод")
     )
     builder.row(
-        types.KeyboardButton(text="💎 Вывод"),
+        types.KeyboardButton(text="📸 Фотобот"),
         types.KeyboardButton(text="👑 Админ")
     )
     return builder.as_markup(resize_keyboard=True)
@@ -598,7 +609,10 @@ def admin_keyboard():
         types.InlineKeyboardButton(text="💰 Баланс", callback_data="admin_give_balance"),
         types.InlineKeyboardButton(text="🧪 Тест", callback_data="admin_test_sponsors")
     )
-    builder.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close"))
+    builder.row(
+        types.InlineKeyboardButton(text="🔍 Тест для юзера", callback_data="admin_test_user"),
+        types.InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")
+    )
     return builder.as_markup()
 
 def withdraw_keyboard():
@@ -742,14 +756,6 @@ async def check_subs(callback: types.CallbackQuery):
         if sponsors:
             await callback.message.edit_reply_markup(reply_markup=sponsors_keyboard(sponsors))
 
-@dp.message(F.text == "💰 Баланс")
-async def balance_cmd(message: types.Message):
-    if not await check_sponsors_before_action(message):
-        return
-    user = await get_user(message.from_user.id)
-    if user:
-        await message.answer(f"💳 *Твой баланс:* {user['balance']:.1f} ⭐", parse_mode="Markdown")
-
 @dp.message(F.text == "👤 Профиль")
 async def profile_cmd(message: types.Message):
     if not await check_sponsors_before_action(message):
@@ -834,7 +840,7 @@ async def process_withdraw(callback: types.CallbackQuery):
             f"Администратор отправит тебе подарок в течение 24 часов.",
             parse_mode="Markdown"
         )
-    except Exception as e:
+    except:
         await callback.message.answer(
             f"✅ *Заявка на вывод {amount} ⭐ принята!*\n"
             f"Администратор отправит тебе подарок в течение 24 часов.",
@@ -846,6 +852,213 @@ async def process_withdraw(callback: types.CallbackQuery):
         except:
             pass
 
+# ========== ФОТОБОТ ==========
+@dp.message(F.text == "📸 Фотобот")
+async def photo_bot_menu(message: types.Message):
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        types.InlineKeyboardButton(text="📤 Выставить фото", callback_data="photo_sell"),
+        types.InlineKeyboardButton(text="🖼 Галерея", callback_data="photo_gallery")
+    )
+    kb.row(types.InlineKeyboardButton(text="❌ Закрыть", callback_data="photo_close"))
+    await message.answer(
+        "📸 *Фотобот*\n\n"
+        "Здесь ты можешь продавать и покупать фотографии за звёзды.\n\n"
+        "Выбери действие:",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "photo_sell")
+async def photo_sell_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для админа!", show_alert=True)
+        return
+    await state.set_state(PhotoState.waiting_for_photo)
+    await callback.message.edit_text(
+        "📤 *Выставить фото*\n\n"
+        "Отправь мне фотографию, которую хочешь продать:",
+        parse_mode="Markdown"
+    )
+
+@dp.message(PhotoState.waiting_for_photo)
+async def photo_sell_photo(message: types.Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("❌ Отправь именно фотографию!")
+        return
+    
+    file_id = message.photo[-1].file_id
+    await state.update_data(file_id=file_id)
+    await state.set_state(PhotoState.waiting_for_price)
+    await message.answer(
+        "💰 Теперь введи цену в звёздах (например: `10`):",
+        parse_mode="Markdown"
+    )
+
+@dp.message(PhotoState.waiting_for_price)
+async def photo_sell_price(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text.replace(",", "."))
+        if price <= 0:
+            await message.answer("❌ Цена должна быть больше 0!")
+            return
+        await state.update_data(price=price)
+        await state.set_state(PhotoState.waiting_for_description)
+        await message.answer(
+            "📝 Введи описание для фото (можно пропустить, отправь `-`):",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await message.answer("❌ Введи число! Пример: `10`")
+
+@dp.message(PhotoState.waiting_for_description)
+async def photo_sell_description(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    description = message.text if message.text != "-" else ""
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO photos (user_id, file_id, price, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            (message.from_user.id, data["file_id"], data["price"], description, time.time())
+        )
+        await db.commit()
+    
+    await state.clear()
+    await message.answer(
+        f"✅ *Фото выставлено на продажу!*\n\n"
+        f"💰 Цена: {data['price']} ⭐\n"
+        f"📝 Описание: {description or 'Нет'}\n\n"
+        f"Ожидай покупателя!",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "photo_gallery")
+async def photo_gallery(callback: types.CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, user_id, file_id, price, description FROM photos WHERE status = 'active' ORDER BY created_at DESC LIMIT 10"
+        ) as c:
+            photos = await c.fetchall()
+    
+    if not photos:
+        await callback.message.edit_text(
+            "🖼 *Галерея*\n\nПока нет фотографий в продаже.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    kb = InlineKeyboardBuilder()
+    for photo_id, user_id, file_id, price, description in photos:
+        kb.row(types.InlineKeyboardButton(
+            text=f"🖼 Фото #{photo_id} — {price} ⭐",
+            callback_data=f"photo_view_{photo_id}"
+        ))
+    kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_back"))
+    
+    await callback.message.edit_text(
+        "🖼 *Галерея*\n\nВыбери фото для просмотра:",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("photo_view_"))
+async def photo_view(callback: types.CallbackQuery):
+    photo_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, file_id, price, description FROM photos WHERE id = ? AND status = 'active'",
+            (photo_id,)
+        ) as c:
+            photo = await c.fetchone()
+    
+    if not photo:
+        await callback.answer("❌ Фото уже продано или удалено!", show_alert=True)
+        return
+    
+    user_id, file_id, price, description = photo
+    
+    kb = InlineKeyboardBuilder()
+    if callback.from_user.id != user_id:
+        kb.row(types.InlineKeyboardButton(
+            text=f"💎 Купить за {price} ⭐",
+            callback_data=f"photo_buy_{photo_id}"
+        ))
+    kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_gallery"))
+    
+    await bot.send_photo(
+        callback.from_user.id,
+        file_id,
+        caption=f"🖼 *Фото #{photo_id}*\n\n"
+                f"💰 Цена: {price} ⭐\n"
+                f"📝 Описание: {description or 'Нет'}\n"
+                f"👤 Продавец: ID {user_id}",
+        reply_markup=kb.as_markup(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("photo_buy_"))
+async def photo_buy(callback: types.CallbackQuery):
+    photo_id = int(callback.data.split("_")[2])
+    buyer_id = callback.from_user.id
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, price FROM photos WHERE id = ? AND status = 'active'",
+            (photo_id,)
+        ) as c:
+            photo = await c.fetchone()
+        
+        if not photo:
+            await callback.answer("❌ Фото уже продано!", show_alert=True)
+            return
+        
+        seller_id, price = photo
+        
+        if buyer_id == seller_id:
+            await callback.answer("❌ Нельзя купить своё же фото!", show_alert=True)
+            return
+        
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (buyer_id,)) as c:
+            buyer = await c.fetchone()
+        
+        if not buyer or buyer[0] < price:
+            await callback.answer(f"❌ Недостаточно средств! Нужно {price} ⭐", show_alert=True)
+            return
+        
+        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, buyer_id))
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (price, seller_id))
+        await db.execute("UPDATE photos SET status = 'sold' WHERE id = ?", (photo_id,))
+        await db.commit()
+    
+    await callback.answer("✅ Покупка успешна!", show_alert=True)
+    await callback.message.delete()
+    await callback.message.answer(
+        f"🎉 *Ты купил фото #{photo_id} за {price} ⭐!*\n"
+        f"Оно сохранено в твоей галерее.",
+        parse_mode="Markdown"
+    )
+    
+    try:
+        await bot.send_message(
+            seller_id,
+            f"🎉 *Твоё фото #{photo_id} купили за {price} ⭐!*\n"
+            f"Деньги зачислены на баланс.",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+
+@dp.callback_query(F.data == "photo_back")
+async def photo_back(callback: types.CallbackQuery):
+    await photo_bot_menu(callback.message)
+
+@dp.callback_query(F.data == "photo_close")
+async def photo_close(callback: types.CallbackQuery):
+    await callback.message.delete()
+
+# ========== АДМИН-ПАНЕЛЬ ==========
 @dp.message(F.text == "👑 Админ")
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
@@ -1015,6 +1228,61 @@ async def admin_test_sponsors(callback: types.CallbackQuery):
     
     text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
+
+@dp.callback_query(F.data == "admin_test_user")
+async def admin_test_user_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Нет доступа!")
+        return
+    await state.set_state(AdminState.waiting_for_user_id)
+    await callback.message.edit_text(
+        "🔍 *Тест спонсоров для пользователя*\n\n"
+        "Введи Telegram ID пользователя:",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminState.waiting_for_user_id)
+async def admin_test_user_process(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        user_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введи число! Пример: `123456789`")
+        return
+    
+    await message.answer(f"🔄 Проверяю спонсоров для `{user_id}`...", parse_mode="Markdown")
+    
+    user = await get_user(user_id)
+    if not user:
+        await message.answer(f"❌ Пользователь `{user_id}` не найден в базе!", parse_mode="Markdown")
+        await state.clear()
+        return
+    
+    results = []
+    
+    piarflow = await test_piarflow(user_id)
+    results.append(f"*Piarflow:* {piarflow}")
+    
+    traffy = await test_traffy(user_id)
+    results.append(f"*Traffy:* {traffy}")
+    
+    flyer = await test_flyer(user_id)
+    results.append(f"*Flyer:* {flyer}")
+    
+    tgrass = await test_tgrass(user_id)
+    results.append(f"*TGrass:* {tgrass}")
+    
+    botohub = await test_botohub(user_id)
+    results.append(f"*Botohub:* {botohub}")
+    
+    status_text = "✅ Активирован" if user.get('is_activated') == 1 else "❌ Не активирован"
+    results.append(f"*Статус:* {status_text}")
+    
+    text = f"🔍 *Результаты для пользователя `{user_id}`:*\n\n" + "\n\n".join(results)
+    await message.answer(text, parse_mode="Markdown")
+    await state.clear()
 
 @dp.callback_query(F.data == "admin_close")
 async def admin_close(callback: types.CallbackQuery):
