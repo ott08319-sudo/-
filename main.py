@@ -66,12 +66,6 @@ async def init_db():
             UNIQUE(user_id, service, assignment_id)
         )""")
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS sponsor_cache (
-            cache_key TEXT PRIMARY KEY,
-            payload TEXT NOT NULL,
-            expires_at REAL NOT NULL
-        )""")
-        await db.execute("""
         CREATE TABLE IF NOT EXISTS sponsor_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -386,7 +380,7 @@ async def test_botohub(user_id: int):
     except Exception as e:
         return f"❌ Ошибка: {str(e)}"
 
-# ========== ОСНОВНАЯ ЛОГИКА ==========
+# ========== ОСНОВНАЯ ЛОГИКА (БЕЗ КЭША) ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
     username = user.username or ""
@@ -395,15 +389,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     is_premium = user.is_premium or False
     
     all_sponsors = []
-    
-    if not force_refresh:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT payload, expires_at FROM sponsor_cache WHERE cache_key = ?", (f"all_sponsors_{user_id}",)) as c:
-                row = await c.fetchone()
-                if row:
-                    payload, expires_at = row
-                    if expires_at > time.time():
-                        return json.loads(payload)
     
     logging.info(f"Запрос спонсоров для {user_id}")
     
@@ -463,12 +448,6 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         await log_sponsor_status(user_id, "not_issued", "Нет активных заданий")
     else:
         await log_sponsor_status(user_id, "issued", f"Выдано {len(all_sponsors)} спонсоров")
-    
-    if all_sponsors:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO sponsor_cache (cache_key, payload, expires_at) VALUES (?, ?, ?)",
-                (f"all_sponsors_{user_id}", json.dumps(all_sponsors), time.time() + 300))
-            await db.commit()
     
     return all_sponsors
 
@@ -549,9 +528,8 @@ async def activate_user(user_id: int):
         await db.commit()
         return True
 
-# ========== УНИВЕРСАЛЬНАЯ ПРОВЕРКА ==========
+# ========== ПРОВЕРКА СПОНСОРОВ ПЕРЕД КНОПКОЙ ==========
 async def check_sponsors_before_action(message: types.Message):
-    """Проверяет, активирован ли пользователь. Если нет — выдаёт спонсоров."""
     user_id = message.from_user.id
     user = await get_user(user_id)
     
@@ -562,7 +540,7 @@ async def check_sponsors_before_action(message: types.Message):
     if user and user.get('is_activated') == 1:
         return True
     
-    sponsors = await get_all_sponsors(message.from_user, force_refresh=True)
+    sponsors = await get_all_sponsors(message.from_user)
     
     if sponsors:
         await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
@@ -604,7 +582,7 @@ async def start_cmd(message: types.Message):
     
     await register_user(user_id, username, referrer_id)
     
-    sponsors = await get_all_sponsors(message.from_user, force_refresh=True)
+    sponsors = await get_all_sponsors(message.from_user)
     
     if sponsors:
         await message.answer("📌 Выполни задания для доступа к боту:", reply_markup=sponsors_keyboard(sponsors))
