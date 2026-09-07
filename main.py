@@ -26,6 +26,7 @@ FLYER_API_KEY = os.getenv("FLYER_API_KEY", "")
 TGRASS_API_KEY = os.getenv("TGRASS_API_KEY", "")
 TRAFFY_API_KEY = os.getenv("TRAFFY_API_KEY", "")
 BOTOHUB_API_KEY = os.getenv("BOTOHUB_API_KEY", "")
+TRAFSLY_API_KEY = os.getenv("TRAFSLY_API_KEY", "")
 
 DB_PATH = "bot.db"
 MAX_SPONSORS = 20
@@ -340,6 +341,111 @@ async def check_botohub_tasks(user_id: int):
         logging.error(f"Botohub check error: {e}")
     return False
 
+# ========== TRAFSLY API ==========
+async def get_trafsly_sponsors(user_id: int, chat_id: int = None, first_name: str = None, username: str = None, language_code: str = "ru", is_premium: bool = False, max_sponsors: int = MAX_SPONSORS):
+    if not TRAFSLY_API_KEY:
+        return []
+    
+    url = "https://api.trafsly.com/api/v1/get-sponsors"
+    headers = {
+        "Auth": TRAFSLY_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "user_id": user_id,
+        "max_sponsors": max_sponsors,
+        "language_code": language_code,
+        "is_premium": is_premium
+    }
+    if chat_id:
+        payload["chat_id"] = chat_id
+    if first_name:
+        payload["first_name"] = first_name
+    if username:
+        payload["username"] = username
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logging.info(f"Trafsly ответ: {data}")
+                    
+                    if data.get("status") == "ok":
+                        return []
+                    
+                    if data.get("status") == "warning":
+                        sponsors = data.get("sponsors", [])
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            for s in sponsors:
+                                ads_id = s.get("ads_id")
+                                link = s.get("link")
+                                if link and ads_id:
+                                    await db.execute(
+                                        "INSERT OR IGNORE INTO sponsor_tasks (user_id, service, assignment_id, link, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (user_id, "trafsly", str(ads_id), link, "unsubscribed", time.time())
+                                    )
+                            await db.commit()
+                        return sponsors
+    except Exception as e:
+        logging.error(f"Ошибка Trafsly: {e}")
+    return []
+
+async def check_trafsly_sponsors(user_id: int, assignment_ids: list):
+    if not TRAFSLY_API_KEY or not assignment_ids:
+        return []
+    
+    url = "https://api.trafsly.com/api/v1/confirm-subscription"
+    headers = {
+        "Auth": TRAFSLY_API_KEY,
+        "Content-Type": "application/json"
+    }
+    
+    results = []
+    for ads_id in assignment_ids:
+        payload = {
+            "user_id": user_id,
+            "ads_id": int(ads_id)
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        logging.info(f"Trafsly проверка ads_id {ads_id}: {data}")
+                        
+                        if data.get("subscribed") == True:
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                await db.execute(
+                                    "UPDATE sponsor_tasks SET status = 'subscribed' WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
+                                    (user_id, str(ads_id))
+                                )
+                                await db.commit()
+                            results.append({"ads_id": ads_id, "status": "subscribed"})
+                        elif data.get("subscribed") == False:
+                            results.append({"ads_id": ads_id, "status": "unsubscribed"})
+                        elif data.get("message") == "User is banned":
+                            logging.warning(f"Пользователь {user_id} забанен в Trafsly")
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                await db.execute(
+                                    "DELETE FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly'",
+                                    (user_id,)
+                                )
+                                await db.commit()
+                            return []
+                        elif "Order not found" in data.get("message", "") or "Sponsor was not shown" in data.get("message", ""):
+                            logging.info(f"Задание {ads_id} для пользователя {user_id} просрочено, удаляем")
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                await db.execute(
+                                    "DELETE FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND assignment_id = ?",
+                                    (user_id, str(ads_id))
+                                )
+                                await db.commit()
+        except Exception as e:
+            logging.error(f"Ошибка проверки Trafsly ads_id {ads_id}: {e}")
+    
+    return results
+
 # ========== ТЕСТЫ СПОНСОРОВ ==========
 async def test_piarflow(user_id: int):
     if not PIARFLOW_API_KEY:
@@ -396,6 +502,17 @@ async def test_botohub(user_id: int):
     except Exception as e:
         return f"❌ Ошибка: {str(e)}"
 
+async def test_trafsly(user_id: int):
+    if not TRAFSLY_API_KEY:
+        return "❌ Ключ не установлен"
+    try:
+        sponsors = await get_trafsly_sponsors(user_id, user_id, max_sponsors=5)
+        if sponsors:
+            return f"✅ {len(sponsors)} спонсоров:\n" + "\n".join([f"  • {s.get('link')}" for s in sponsors[:5]])
+        return "❌ 0 спонсоров (нет заданий или ошибка)"
+    except Exception as e:
+        return f"❌ Ошибка: {str(e)}"
+
 # ========== ОСНОВНАЯ ЛОГИКА ==========
 async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     user_id = user.id
@@ -408,6 +525,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
     
     logging.info(f"Запрос спонсоров для {user_id}")
     
+    # Piarflow
     piarflow = await get_piarflow_sponsors(user_id, user_id, MAX_SPONSORS)
     for s in piarflow:
         await log_sponsor(user_id, "piarflow", s.get("link"), "выдан")
@@ -417,6 +535,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(piarflow)
     
+    # Flyer
     flyer = await get_flyer_tasks(user_id, lang)
     for s in flyer:
         await log_sponsor(user_id, "flyer", s.get("link"), "выдан")
@@ -426,6 +545,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(flyer)
     
+    # TGrass
     tgrass = await get_tgrass_offers(user_id, username, lang, is_premium)
     for s in tgrass:
         await log_sponsor(user_id, "tgrass", s.get("link"), "выдан")
@@ -435,6 +555,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(tgrass)
     
+    # Traffy
     traffy = await get_traffy_tasks(user_id, MAX_SPONSORS, first_name, username, lang)
     for s in traffy:
         await log_sponsor(user_id, "traffy", s.get("target_link"), "выдан")
@@ -444,6 +565,7 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
         )
     all_sponsors.extend(traffy)
     
+    # Botohub
     botohub = await get_botohub_tasks(user_id)
     for s in botohub:
         await log_sponsor(user_id, "botohub", s, "выдан")
@@ -452,6 +574,14 @@ async def get_all_sponsors(user: types.User, force_refresh: bool = False):
             (user_id, "botohub", s, s, "unsubscribed", time.time())
         )
     all_sponsors.extend(botohub)
+    
+    # Trafsly
+    trafsly = await get_trafsly_sponsors(
+        user_id, user_id, first_name, username, lang, is_premium, MAX_SPONSORS
+    )
+    for s in trafsly:
+        await log_sponsor(user_id, "trafsly", s.get("link"), "выдан")
+    all_sponsors.extend(trafsly)
     
     logging.info(f"Всего спонсоров: {len(all_sponsors)}")
     
@@ -563,7 +693,7 @@ async def check_sponsors_before_action(message: types.Message):
         await message.answer("🎉 Добро пожаловать!", reply_markup=main_menu())
         return True
 
-# ========== КРАСИВЫЕ КНОПКИ ==========
+# ========== МЕНЮ ==========
 def main_menu():
     builder = ReplyKeyboardBuilder()
     builder.row(
@@ -731,6 +861,15 @@ async def check_subs(callback: types.CallbackQuery):
             )
             await db.commit()
     
+    # 6. Trafsly
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT assignment_id FROM sponsor_tasks WHERE user_id = ? AND service = 'trafsly' AND status != 'subscribed'", (user_id,)) as c:
+            trafsly_tasks = await c.fetchall()
+    
+    if trafsly_tasks:
+        assignment_ids = [int(t[0]) for t in trafsly_tasks]
+        await check_trafsly_sponsors(user_id, assignment_ids)
+    
     # ФИНАЛЬНАЯ ПРОВЕРКА
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM sponsor_tasks WHERE user_id = ? AND status != 'subscribed'", (user_id,)) as c:
@@ -871,9 +1010,7 @@ async def photo_bot_menu(message: types.Message):
 
 @dp.callback_query(F.data == "photo_sell")
 async def photo_sell_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("❌ Только для админа!", show_alert=True)
-        return
+    # Доступно ВСЕМ пользователям
     await state.set_state(PhotoState.waiting_for_photo)
     await callback.message.edit_text(
         "📤 *Выставить фото*\n\n"
@@ -956,7 +1093,8 @@ async def photo_gallery(callback: types.CallbackQuery):
     kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_back"))
     
     await callback.message.edit_text(
-        "🖼 *Галерея*\n\nВыбери фото для просмотра:",
+        "🖼 *Галерея*\n\n"
+        "Выбери фото для просмотра. *Оно замазано* — купи, чтобы увидеть оригинал!",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
@@ -986,13 +1124,15 @@ async def photo_view(callback: types.CallbackQuery):
         ))
     kb.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="photo_gallery"))
     
+    # Отправляем фото с пометкой, что оно замазано
     await bot.send_photo(
         callback.from_user.id,
         file_id,
         caption=f"🖼 *Фото #{photo_id}*\n\n"
                 f"💰 Цена: {price} ⭐\n"
                 f"📝 Описание: {description or 'Нет'}\n"
-                f"👤 Продавец: ID {user_id}",
+                f"👤 Продавец: ID {user_id}\n\n"
+                f"🔒 *Фото замазано. Купи, чтобы увидеть оригинал!*",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown"
     )
@@ -1005,7 +1145,7 @@ async def photo_buy(callback: types.CallbackQuery):
     
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT user_id, price FROM photos WHERE id = ? AND status = 'active'",
+            "SELECT user_id, file_id, price, description FROM photos WHERE id = ? AND status = 'active'",
             (photo_id,)
         ) as c:
             photo = await c.fetchone()
@@ -1014,7 +1154,7 @@ async def photo_buy(callback: types.CallbackQuery):
             await callback.answer("❌ Фото уже продано!", show_alert=True)
             return
         
-        seller_id, price = photo
+        seller_id, file_id, price, description = photo
         
         if buyer_id == seller_id:
             await callback.answer("❌ Нельзя купить своё же фото!", show_alert=True)
@@ -1033,13 +1173,19 @@ async def photo_buy(callback: types.CallbackQuery):
         await db.commit()
     
     await callback.answer("✅ Покупка успешна!", show_alert=True)
-    await callback.message.delete()
-    await callback.message.answer(
-        f"🎉 *Ты купил фото #{photo_id} за {price} ⭐!*\n"
-        f"Оно сохранено в твоей галерее.",
+    
+    # Отправляем оригинал фото покупателю
+    await bot.send_photo(
+        buyer_id,
+        file_id,
+        caption=f"🖼 *Ты купил фото #{photo_id}!*\n\n"
+                f"💰 Цена: {price} ⭐\n"
+                f"📝 Описание: {description or 'Нет'}\n"
+                f"👤 Продавец: ID {seller_id}",
         parse_mode="Markdown"
     )
     
+    # Уведомляем продавца
     try:
         await bot.send_message(
             seller_id,
@@ -1226,6 +1372,9 @@ async def admin_test_sponsors(callback: types.CallbackQuery):
     botohub = await test_botohub(user_id)
     results.append(f"*Botohub:* {botohub}")
     
+    trafsly = await test_trafsly(user_id)
+    results.append(f"*Trafsly:* {trafsly}")
+    
     text = "🧪 *Результаты теста спонсоров:*\n\n" + "\n\n".join(results)
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_keyboard())
 
@@ -1276,6 +1425,9 @@ async def admin_test_user_process(message: types.Message, state: FSMContext):
     
     botohub = await test_botohub(user_id)
     results.append(f"*Botohub:* {botohub}")
+    
+    trafsly = await test_trafsly(user_id)
+    results.append(f"*Trafsly:* {trafsly}")
     
     status_text = "✅ Активирован" if user.get('is_activated') == 1 else "❌ Не активирован"
     results.append(f"*Статус:* {status_text}")
